@@ -9,18 +9,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 from simulation.database import SimulationDatabase
+from simulation.faults import (
+    NodeFaultSchedule,
+    create_node_fault_schedules,
+    fault_model_configuration,
+)
 from simulation.engine import SimulationError, validate_node_configs
 from simulation.models import (
     DEFAULT_ADAPTIVE_WEIGHTS,
     DEFAULT_NODE_CONFIGS,
     TASK_TEMPLATES,
-    WORKLOAD_PROFILES,
+    WORKLOAD_NAMES,
     Node,
     Task,
     simulation_iso_time,
     utc_now_iso,
+    workload_arrival_rate,
 )
 from simulation.scheduler import (
+    ALGORITHM_LABELS as SCHEDULER_LABELS,
+    GROUP_1_ALGORITHMS,
+    GROUP_2_ALGORITHMS,
+    SchedulerState,
     SchedulingError,
     choose_candidate,
     eligible_candidates,
@@ -30,20 +40,16 @@ from simulation.scheduler import (
 
 
 BENCHMARK_ALGORITHMS = (
-    "round_robin",
-    "weighted_round_robin",
-    "least_loaded",
+    *GROUP_1_ALGORITHMS,
     "min_min",
-    "adaptive_fog_cloud",
+    *GROUP_2_ALGORITHMS,
 )
 ALGORITHM_LABELS = {
-    "round_robin": "Round Robin",
-    "weighted_round_robin": "Weighted Round Robin",
-    "least_loaded": "Least Loaded",
+    **SCHEDULER_LABELS,
     "min_min": "Min-Min Scheduling",
-    "adaptive_fog_cloud": "Adaptive Fog–Cloud",
 }
 MIN_MIN_BATCH_SECONDS = 1.0
+BENCHMARK_DURATIONS = (15, 30, 60, 120, 300, 600)
 
 
 class BenchmarkCancelled(Exception):
@@ -54,19 +60,25 @@ def prepare_workload(
     duration_seconds: int,
     workload: str,
     *,
+    manual_tasks_per_minute: int | None = None,
     epoch: datetime | None = None,
 ) -> list[dict[str, Any]]:
     if (
         isinstance(duration_seconds, bool)
         or not isinstance(duration_seconds, int)
-        or duration_seconds not in {30, 60, 120}
+        or duration_seconds not in BENCHMARK_DURATIONS
     ):
-        raise SimulationError("duration_seconds must be 30, 60, or 120.")
-    if not isinstance(workload, str) or workload not in WORKLOAD_PROFILES:
-        raise SimulationError("workload must be light, normal, or heavy.")
+        raise SimulationError(
+            f"duration_seconds must be one of: {', '.join(map(str, BENCHMARK_DURATIONS))}."
+        )
+    if not isinstance(workload, str) or workload not in WORKLOAD_NAMES:
+        raise SimulationError("workload must be light, normal, heavy, extreme, or manual.")
+    try:
+        rate = workload_arrival_rate(workload, manual_tasks_per_minute)
+    except ValueError as exc:
+        raise SimulationError(str(exc)) from exc
 
     start = epoch or datetime(2000, 1, 1, tzinfo=timezone.utc)
-    rate = WORKLOAD_PROFILES[workload]["arrival_rate_per_second"]
     task_count = int(math.floor(duration_seconds * rate + 1e-12))
     definitions: list[dict[str, Any]] = []
     for index in range(task_count):
@@ -98,7 +110,7 @@ def _new_task(definition: dict[str, Any]) -> Task:
 
 
 def _start_next(node: Node, tasks: dict[str, Task], now: float) -> None:
-    if node.active_task_id is not None or not node.queue:
+    if not node.online or node.active_task_id is not None or not node.queue:
         return
     task_id = node.queue.pop(0)
     task = tasks[task_id]
@@ -144,6 +156,7 @@ def _schedule_individual(
     now: float,
     weights: dict[str, float],
     round_robin_offset: int,
+    scheduler_state: SchedulerState,
 ) -> int:
     candidates, excluded = eligible_candidates(nodes, tasks, task, now)
     if not candidates:
@@ -157,7 +170,7 @@ def _schedule_individual(
 
     try:
         selected, reason = choose_candidate(
-            algorithm, candidates, round_robin_offset, weights
+            algorithm, candidates, round_robin_offset, weights, scheduler_state
         )
     except SchedulingError as exc:
         raise SimulationError(str(exc)) from exc
@@ -235,6 +248,7 @@ def run_experiment(
     weights: dict[str, float],
     duration_seconds: int,
     *,
+    failure_seed: int = 0,
     cancellation: threading.Event | None = None,
     progress: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
@@ -243,9 +257,11 @@ def run_experiment(
     if (
         isinstance(duration_seconds, bool)
         or not isinstance(duration_seconds, int)
-        or duration_seconds not in {30, 60, 120}
+        or duration_seconds not in BENCHMARK_DURATIONS
     ):
-        raise SimulationError("duration_seconds must be 30, 60, or 120.")
+        raise SimulationError(
+            f"duration_seconds must be one of: {', '.join(map(str, BENCHMARK_DURATIONS))}."
+        )
     try:
         checked_weights = validate_weights(weights)
         if algorithm != "min_min":
@@ -254,6 +270,14 @@ def run_experiment(
         raise SimulationError(str(exc)) from exc
 
     nodes = validate_node_configs([dict(config) for config in node_configs])
+    node_faults: dict[str, NodeFaultSchedule] = create_node_fault_schedules(
+        nodes, failure_seed
+    )
+    algorithm_seed = failure_seed ^ sum(
+        (index + 1) * ord(character)
+        for index, character in enumerate(algorithm)
+    )
+    scheduler_state = SchedulerState(algorithm_seed)
     tasks: dict[str, Task] = {}
     definitions = iter(task_definitions)
     next_definition = next(definitions, None)
@@ -269,6 +293,11 @@ def run_experiment(
         if cancellation is not None and cancellation.is_set():
             raise BenchmarkCancelled("Benchmark cancellation was requested.")
 
+        if next_definition is None and not pending_batch and not any(
+            node.active_task_id is not None or node.queue for node in nodes
+        ):
+            break
+
         completion_times = [
             node.active_task_finishes_at
             for node in nodes
@@ -279,6 +308,10 @@ def run_experiment(
             for event in (
                 next_definition["arrival_clock"] if next_definition is not None else None,
                 min(completion_times) if completion_times else None,
+                min(
+                    (schedule.next_transition_at for schedule in node_faults.values()),
+                    default=None,
+                ),
                 next_min_min_batch
                 if algorithm == "min_min"
                 and pending_batch
@@ -324,6 +357,43 @@ def run_experiment(
                 node.active_task_finishes_at = None
                 _start_next(node, tasks, now)
 
+        for node in nodes:
+            schedule = node_faults.get(node.node_id)
+            if (
+                schedule is None
+                or schedule.next_transition_at > now + 1e-12
+            ):
+                continue
+            if schedule.transition(now):
+                node.online = False
+                if node.active_task_id is not None:
+                    failed_task = tasks[node.active_task_id]
+                    processing_elapsed = max(
+                        0.0,
+                        now
+                        - (
+                            node.active_task_started_at
+                            if node.active_task_started_at is not None
+                            else now
+                        )
+                        - node.network_latency_ms / 1000.0,
+                    )
+                    busy_seconds[node.node_id] += min(
+                        failed_task.cpu_demand / node.processing_rate,
+                        processing_elapsed,
+                    )
+                    failed_task.status = "failed"
+                    failed_task.allocation_explanation += (
+                        f" Task failed when {node.name} experienced a transient "
+                        "node outage during processing."
+                    )
+                    node.active_task_id = None
+                    node.active_task_started_at = None
+                    node.active_task_finishes_at = None
+            else:
+                node.online = True
+                _start_next(node, tasks, now)
+
         while (
             next_definition is not None
             and next_definition["arrival_clock"] <= now + 1e-12
@@ -341,6 +411,7 @@ def run_experiment(
                     now,
                     checked_weights,
                     round_robin_offset,
+                    scheduler_state,
                 )
             next_definition = next(definitions, None)
 
@@ -395,7 +466,9 @@ def run_experiment(
     task_records = sorted(tasks.values(), key=lambda task: task.task_id)
     task_count = len(task_records)
     completed_count = sum(task.status == "completed" for task in task_records)
-    failed_count = sum(task.status == "rejected" for task in task_records)
+    failed_count = sum(
+        task.status in {"failed", "rejected"} for task in task_records
+    )
     response_times = [
         task.actual_response_time_ms
         for task in task_records
@@ -522,15 +595,26 @@ class BenchmarkManager:
         self._cancellation: threading.Event | None = None
         self.database.mark_interrupted_benchmarks(utc_now_iso())
 
-    def start(self, duration_seconds: int, workload: str) -> dict[str, Any]:
+    def start(
+        self,
+        duration_seconds: int,
+        workload: str,
+        manual_tasks_per_minute: int | None = None,
+    ) -> dict[str, Any]:
         if (
             isinstance(duration_seconds, bool)
             or not isinstance(duration_seconds, int)
-            or duration_seconds not in {30, 60, 120}
+            or duration_seconds not in BENCHMARK_DURATIONS
         ):
-            raise SimulationError("duration_seconds must be 30, 60, or 120.")
-        if not isinstance(workload, str) or workload not in WORKLOAD_PROFILES:
-            raise SimulationError("workload must be light, normal, or heavy.")
+            raise SimulationError(
+                f"duration_seconds must be one of: {', '.join(map(str, BENCHMARK_DURATIONS))}."
+            )
+        if not isinstance(workload, str) or workload not in WORKLOAD_NAMES:
+            raise SimulationError("workload must be light, normal, heavy, extreme, or manual.")
+        try:
+            workload_arrival_rate(workload, manual_tasks_per_minute)
+        except ValueError as exc:
+            raise SimulationError(str(exc)) from exc
         with self._lock:
             if self._active_id is not None:
                 active = self.database.get_benchmark(self._active_id)
@@ -538,14 +622,23 @@ class BenchmarkManager:
                     raise SimulationError("A benchmark is already running.", 409)
             benchmark_id = str(uuid.uuid4())
             created_at = utc_now_iso()
-            task_definitions = prepare_workload(duration_seconds, workload)
+            task_definitions = prepare_workload(
+                duration_seconds,
+                workload,
+                manual_tasks_per_minute=manual_tasks_per_minute,
+            )
+            node_configs = [dict(config) for config in self.node_configs]
             configuration = {
                 "duration_seconds": duration_seconds,
                 "workload": workload,
+                "manual_tasks_per_minute": manual_tasks_per_minute,
                 "task_count": len(task_definitions),
                 "algorithm_order": list(BENCHMARK_ALGORITHMS),
                 "adaptive_weights": self.weights,
-                "node_configs": self.node_configs,
+                "failure_model": fault_model_configuration(
+                    uuid.UUID(benchmark_id).int & 0xFFFFFFFF
+                ),
+                "node_configs": node_configs,
                 "min_min_batch_seconds": MIN_MIN_BATCH_SECONDS,
                 "workload_generator": "deterministic-cyclic-templates-v1",
             }
@@ -566,13 +659,21 @@ class BenchmarkManager:
                     benchmark_id,
                     duration_seconds,
                     task_definitions,
+                    node_configs,
                     cancellation,
+                    uuid.UUID(benchmark_id).int & 0xFFFFFFFF,
                 ),
                 name=f"fogflow-benchmark-{benchmark_id[:8]}",
                 daemon=True,
             )
             worker.start()
             return self.database.get_benchmark(benchmark_id) or {}
+
+    def set_node_configs(self, node_configs: list[dict[str, Any]]) -> None:
+        validated_configs = [dict(config) for config in node_configs]
+        validate_node_configs(validated_configs)
+        with self._lock:
+            self.node_configs = validated_configs
 
     def cancel(self, benchmark_id: str) -> dict[str, Any]:
         with self._lock:
@@ -603,12 +704,23 @@ class BenchmarkManager:
             raise SimulationError("Benchmark not found.", 404)
         if record["status"] != "completed":
             raise SimulationError(
-                "Benchmark results are available only after all five experiments complete.",
+                "Benchmark results are available only after all configured experiments complete.",
                 409,
             )
-        if record["result_count"] != len(BENCHMARK_ALGORITHMS):
+        saved_results = record["results"]
+        saved_order = record["configuration"].get("algorithm_order")
+        saved_algorithms = [result["algorithm"] for result in saved_results]
+        if (
+            record["result_count"] != len(saved_results)
+            or (
+                isinstance(saved_order, list)
+                and saved_algorithms != saved_order
+            )
+        ):
             raise SimulationError(
-                "The completed benchmark has an invalid result count.", 500
+                "The completed benchmark results do not match their saved "
+                "algorithm configuration.",
+                500,
             )
         return {
             "benchmark_id": benchmark_id,
@@ -647,7 +759,9 @@ class BenchmarkManager:
         benchmark_id: str,
         duration_seconds: int,
         task_definitions: list[dict[str, Any]],
+        node_configs: list[dict[str, Any]],
         cancellation: threading.Event,
+        failure_seed: int,
     ) -> None:
         started_at = time.monotonic()
         results: list[dict[str, Any]] = []
@@ -689,9 +803,10 @@ class BenchmarkManager:
                 result = self.runner(
                     algorithm,
                     task_definitions,
-                    self.node_configs,
+                    node_configs,
                     self.weights,
                     duration_seconds,
+                    failure_seed=failure_seed,
                     cancellation=cancellation,
                     progress=report_progress,
                 )

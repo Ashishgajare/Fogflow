@@ -6,6 +6,7 @@ import {
   type FormEvent,
 } from 'react'
 import {
+  configureFogNodes,
   generateTask,
   generateTasks,
   getHealth,
@@ -27,8 +28,8 @@ import SmartCityMap, { type MapAllocation } from './SmartCityMap'
 import AlgorithmComparison from './AlgorithmComparison'
 import BenchmarkPage from './BenchmarkPage'
 import {
-  CITY_COMPUTE_NODES,
   CITY_SENSORS,
+  getCityComputeNodes,
   type CityDevice,
   type CitySensor,
 } from './sceneData'
@@ -59,6 +60,15 @@ const nodeTones: Record<NodeTelemetry['node_type'], string> = {
   fog: 'emerald',
   cloud: 'blue',
 }
+
+const workloadProfiles: { name: Workload; tasksPerMinute: number | null }[] = [
+  { name: 'light', tasksPerMinute: 60 },
+  { name: 'normal', tasksPerMinute: 240 },
+  { name: 'heavy', tasksPerMinute: 600 },
+  { name: 'extreme', tasksPerMinute: 1200 },
+  { name: 'manual', tasksPerMinute: null },
+]
+const MANUAL_TASKS_PER_MINUTE_MAX = 10_000
 
 function Icon({ name, className = '' }: { name: string; className?: string }) {
   return (
@@ -105,6 +115,12 @@ function getNodeName(nodeId: string | null, nodes: NodeTelemetry[]): string {
   return nodes.find((node) => node.id === nodeId)?.name ?? nodeId
 }
 
+function describeNodeCounts(nodes: NodeTelemetry[]): string {
+  const fogCount = nodes.filter((node) => node.node_type === 'fog').length
+  const cloudCount = nodes.filter((node) => node.node_type === 'cloud').length
+  return `${fogCount} fog · ${cloudCount} cloud · ${nodes.length} total`
+}
+
 function Dashboard({
   connection,
   onConnectionChange,
@@ -121,6 +137,9 @@ function Dashboard({
   const [notice, setNotice] = useState<string | null>(null)
   const [algorithm, setAlgorithm] = useState<Algorithm>('adaptive_fog_cloud')
   const [workload, setWorkload] = useState<Workload>('normal')
+  const [manualTasksPerMinute, setManualTasksPerMinute] = useState(1200)
+  const [fogNodeCount, setFogNodeCount] = useState(3)
+  const [configuredFogNodeCount, setConfiguredFogNodeCount] = useState(3)
   const [selectedDevice, setSelectedDevice] = useState<CityDevice | null>(null)
   const [allocation, setAllocation] = useState<MapAllocation | null>(null)
   const [taskFailure, setTaskFailure] = useState<{ taskId: string | null; message: string } | null>(null)
@@ -199,8 +218,17 @@ function Dashboard({
         metricsResult.status === 'fulfilled'
       ) {
         setNodes(nodesResult.value.nodes)
+        const configuredFogCount = nodesResult.value.nodes.filter(
+          (node) => node.node_type === 'fog',
+        ).length
+        setFogNodeCount(configuredFogCount)
+        setConfiguredFogNodeCount(configuredFogCount)
         setTasks(tasksResult.value.tasks)
         setMetrics(metricsResult.value)
+        setWorkload(metricsResult.value.workload)
+        if (metricsResult.value.manual_tasks_per_minute !== null) {
+          setManualTasksPerMinute(metricsResult.value.manual_tasks_per_minute)
+        }
         setError(null)
       }
 
@@ -274,7 +302,11 @@ function Dashboard({
 
   const start = () =>
     runAction(async () => {
-      const response = await startSimulation(workload, algorithm)
+      const response = await startSimulation(
+        workload,
+        algorithm,
+        workload === 'manual' ? manualTasksPerMinute : undefined,
+      )
       setMetrics((current) =>
         current
           ? {
@@ -282,6 +314,7 @@ function Dashboard({
               state: response.simulation.state,
               algorithm: response.simulation.algorithm,
               workload: response.simulation.workload,
+              manual_tasks_per_minute: response.simulation.manual_tasks_per_minute,
             }
           : current,
       )
@@ -310,6 +343,7 @@ function Dashboard({
     runAction(async () => {
       const response = await resetSimulation()
       setAllocation(null)
+      setTasks([])
       setTaskFailure(null)
       setSelectedDevice(null)
       setMetrics((current) =>
@@ -324,21 +358,47 @@ function Dashboard({
               tasks_completed: 0,
               tasks_running: 0,
               tasks_queued: 0,
+              tasks_failed: 0,
               tasks_rejected: 0,
               average_response_time_ms: null,
               task_counts_by_sensor: {},
+              manual_tasks_per_minute: response.simulation.manual_tasks_per_minute,
             }
           : current,
       )
       setAlgorithm(response.simulation.algorithm)
       setWorkload(response.simulation.workload)
+      setManualTasksPerMinute(response.simulation.manual_tasks_per_minute ?? 1200)
       return 'Simulation reset. The previous run remains stored in SQLite.'
+    })
+
+  const resetFromSettings = () => {
+    if (
+      !window.confirm(
+        'Reset the live simulation and start a fresh run? The previous live run will remain in history. Benchmark history will not be changed.',
+      )
+    ) {
+      return
+    }
+    void reset()
+  }
+
+  const applyFogNodeCount = () =>
+    runAction(async () => {
+      const response = await configureFogNodes(fogNodeCount)
+      setNodes(response.nodes)
+      setConfiguredFogNodeCount(fogNodeCount)
+      return `Configured ${fogNodeCount} fog nodes for the Mumbai simulation.`
     })
 
   const generate = () =>
     runAction(async () => {
       if (metrics?.state === 'idle' || metrics?.state === 'reset' || !metrics) {
-        const started = await startSimulation(workload, algorithm)
+        const started = await startSimulation(
+          workload,
+          algorithm,
+          workload === 'manual' ? manualTasksPerMinute : undefined,
+        )
         setMetrics((current) =>
           current
             ? {
@@ -346,6 +406,7 @@ function Dashboard({
                 state: started.simulation.state,
                 algorithm: started.simulation.algorithm,
                 workload: started.simulation.workload,
+                manual_tasks_per_minute: started.simulation.manual_tasks_per_minute,
               }
             : current,
         )
@@ -373,7 +434,11 @@ function Dashboard({
           metrics.state === 'idle' ||
           metrics.state === 'reset'
         ) {
-          const started = await startSimulation(workload, algorithm)
+          const started = await startSimulation(
+            workload,
+            algorithm,
+            workload === 'manual' ? manualTasksPerMinute : undefined,
+          )
           selectedAlgorithm = started.simulation.algorithm
           setMetrics((current) =>
             current
@@ -382,6 +447,7 @@ function Dashboard({
                   state: started.simulation.state,
                   algorithm: started.simulation.algorithm,
                   workload: started.simulation.workload,
+                  manual_tasks_per_minute: started.simulation.manual_tasks_per_minute,
                 }
               : current,
           )
@@ -395,15 +461,20 @@ function Dashboard({
           typeof task.task_id !== 'string' ||
           typeof task.source_sensor_id !== 'string' ||
           typeof task.allocation_explanation !== 'string' ||
-          !['pending', 'queued', 'running', 'completed', 'rejected'].includes(task.status)
+          !['pending', 'queued', 'running', 'completed', 'failed', 'rejected'].includes(task.status)
         ) {
           throw new Error('The backend returned an invalid task allocation response.')
         }
 
         const destination = task.assigned_node_id
-          ? CITY_COMPUTE_NODES.find((node) => node.backendNodeId === task.assigned_node_id)
+          ? getCityComputeNodes(nodes).find((node) => node.backendNodeId === task.assigned_node_id)
           : undefined
-        if (task.status === 'rejected' || !task.assigned_node_id || !destination) {
+        if (
+          task.status === 'failed' ||
+          task.status === 'rejected' ||
+          !task.assigned_node_id ||
+          !destination
+        ) {
           const message =
             task.allocation_explanation || 'The scheduler did not assign this task to a node.'
           setTaskFailure({ taskId: task.task_id, message })
@@ -427,7 +498,7 @@ function Dashboard({
         setBusy(false)
       }
     },
-    [algorithm, metrics, refreshData, workload],
+    [algorithm, manualTasksPerMinute, metrics, nodes, refreshData, workload],
   )
 
   const generateManualTask = (event: FormEvent<HTMLFormElement>) => {
@@ -465,6 +536,12 @@ function Dashboard({
     CITY_SENSORS.find((sensor) => sensor.id === manualSensorId) ?? CITY_SENSORS[0]
   const activeNodes = nodes.filter((node) => node.online && node.active_task_id !== null).length
   const onlineNodes = nodes.filter((node) => node.online).length
+  const fogNodeConfigurationLocked =
+    busy || state !== 'idle' || tasksGenerated > 0 || connection !== 'connected'
+  const validManualWorkload =
+    Number.isInteger(manualTasksPerMinute) &&
+    manualTasksPerMinute >= 1 &&
+    manualTasksPerMinute <= MANUAL_TASKS_PER_MINUTE_MAX
   const events = tasks
     .filter((task) => task.assigned_node_id || task.status === 'rejected')
     .slice(0, 5)
@@ -526,6 +603,8 @@ function Dashboard({
           {workspacePage === 'benchmarks' ? (
             <BenchmarkPage
               connected={connection === 'connected'}
+              loadingNodes={loading}
+              nodes={nodes}
               onViewComparison={showComparison}
             />
           ) : workspacePage === 'comparison' ? (
@@ -552,12 +631,24 @@ function Dashboard({
                     onChange={(event) => setAlgorithm(event.target.value as Algorithm)}
                     disabled={busy || metrics?.state === 'running' || metrics?.state === 'paused'}
                   >
+                    <optgroup label="Group 1 · Current algorithms">
                     <option value="round_robin">Round Robin</option>
                     <option value="weighted_round_robin">Weighted Round Robin</option>
                     <option value="least_loaded">Least Loaded</option>
-                    <option value="adaptive_fog_cloud">Adaptive Fog–Cloud</option>
+                    <option value="adaptive_fog_cloud">Weighted Sum Model (WSM)</option>
+                    </optgroup>
+                    <optgroup label="Group 2 · Advanced algorithms">
+                      <option value="fuzzy_logic">Fuzzy Logic</option>
+                      <option value="topsis">TOPSIS</option>
+                      <option value="ant_colony">Ant Colony Optimization (ACO)</option>
+                      <option value="particle_swarm">Particle Swarm Optimization (PSO)</option>
+                    </optgroup>
                   </select>
                   <small>Used when starting the next ordinary simulation run.</small>
+                  <small>
+                    WSM minimizes a normalized weighted sum of response time,
+                    projected utilization, and estimated completion time.
+                  </small>
                 </div>
                 <div className="settings-field">
                   <label htmlFor="settings-workload">Automatic live workload</label>
@@ -570,8 +661,24 @@ function Dashboard({
                     <option value="light">Light</option>
                     <option value="normal">Normal</option>
                     <option value="heavy">Heavy</option>
+                    <option value="extreme">Extreme</option>
+                    <option value="manual">Manual</option>
                   </select>
                   <small>Tasks are generated automatically while a live simulation runs.</small>
+                  {workload === 'manual' && (
+                    <label>
+                      <span>Manual arrival rate · tasks per minute</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max={MANUAL_TASKS_PER_MINUTE_MAX}
+                        step="1"
+                        value={manualTasksPerMinute}
+                        onChange={(event) => setManualTasksPerMinute(Number(event.target.value))}
+                        disabled={busy || metrics?.state === 'running' || metrics?.state === 'paused'}
+                      />
+                    </label>
+                  )}
                 </div>
                 <div className="settings-field">
                   <span>Backend API health</span>
@@ -582,6 +689,22 @@ function Dashboard({
                   <span>Benchmark defaults</span>
                   <strong>60 simulated seconds · Normal deterministic workload</strong>
                   <small>Duration and workload can be changed before each benchmark.</small>
+                </div>
+                <div className="settings-field settings-field--recovery">
+                  <span>Simulation recovery</span>
+                  <small>
+                    If the live dashboard or simulation gets stuck, reset the active
+                    live run and start fresh. The previous live run and benchmark
+                    history are preserved.
+                  </small>
+                  <button
+                    className="control-button control-button--secondary"
+                    type="button"
+                    onClick={resetFromSettings}
+                    disabled={busy}
+                  >
+                    <Icon name="restart_alt" />Reset live simulation
+                  </button>
                 </div>
               </section>
             </div>
@@ -606,10 +729,18 @@ function Dashboard({
                       onChange={(event) => setAlgorithm(event.target.value as Algorithm)}
                       disabled={busy || state !== 'idle'}
                     >
+                      <optgroup label="Group 1 · Current algorithms">
                       <option value="round_robin">Round Robin</option>
                       <option value="weighted_round_robin">Weighted Round Robin</option>
                       <option value="least_loaded">Least Loaded</option>
-                      <option value="adaptive_fog_cloud">Adaptive Fog–Cloud</option>
+                      <option value="adaptive_fog_cloud">Weighted Sum Model (WSM)</option>
+                      </optgroup>
+                      <optgroup label="Group 2 · Advanced algorithms">
+                        <option value="fuzzy_logic">Fuzzy Logic</option>
+                        <option value="topsis">TOPSIS</option>
+                        <option value="ant_colony">Ant Colony Optimization (ACO)</option>
+                        <option value="particle_swarm">Particle Swarm Optimization (PSO)</option>
+                      </optgroup>
                     </select>
                   </label>
                   <label>
@@ -622,6 +753,8 @@ function Dashboard({
                       <option value="light">Light</option>
                       <option value="normal">Normal</option>
                       <option value="heavy">Heavy</option>
+                      <option value="extreme">Extreme</option>
+                      <option value="manual">Manual</option>
                     </select>
                   </label>
                   {state === 'running' ? (
@@ -633,14 +766,14 @@ function Dashboard({
                       <Icon name="play_arrow" />Resume
                     </button>
                   ) : (
-                    <button className="control-button control-button--primary" onClick={start} disabled={busy || connection !== 'connected'}>
+                    <button className="control-button control-button--primary" onClick={start} disabled={busy || connection !== 'connected' || (workload === 'manual' && !validManualWorkload)}>
                       <Icon name="play_arrow" />Start
                     </button>
                   )}
                   <button className="control-button control-button--secondary" onClick={reset} disabled={busy}>
                     <Icon name="restart_alt" />Reset
                   </button>
-                  <button className="control-button control-button--generate" onClick={generate} disabled={busy || connection !== 'connected'}>
+                  <button className="control-button control-button--generate" onClick={generate} disabled={busy || connection !== 'connected' || (workload === 'manual' && !validManualWorkload)}>
                     <Icon name="add" />Generate Tasks
                   </button>
                   <button
@@ -658,6 +791,72 @@ function Dashboard({
               <p className="auto-generation-note">
                 Automatic sensor requests are generated while the simulation is running.
               </p>
+              <div className="simulation-config">
+                <div className="fog-node-slider">
+                  <label htmlFor="fog-node-count">
+                    <span> Mumbai fog nodes</span>
+                    <strong>{fogNodeCount} / 75</strong>
+                  </label>
+                  <input
+                    id="fog-node-count"
+                    type="range"
+                    min="1"
+                    max="75"
+                    step="1"
+                    value={fogNodeCount}
+                    onChange={(event) => setFogNodeCount(Number(event.target.value))}
+                    disabled={fogNodeConfigurationLocked}
+                  />
+                  <small>
+                    {fogNodeConfigurationLocked
+                      ? 'Reset the run to change the node count.'
+                      : 'Choose 1–75 fog nodes; one cloud server is included.'}
+                  </small>
+                  <button
+                    type="button"
+                    className="control-button control-button--secondary"
+                    onClick={applyFogNodeCount}
+                    disabled={fogNodeConfigurationLocked || fogNodeCount === configuredFogNodeCount}
+                  >
+                    Apply fog nodes
+                  </button>
+                </div>
+                <div className="workload-rates" aria-label="Automatic task arrival rates">
+                  <span className="section-label">Mumbai task arrivals · per minute</span>
+                  <div className="workload-rate-list">
+                    {workloadProfiles.map((profile) => (
+                      <span
+                        className={workload === profile.name ? 'workload-rate workload-rate--selected' : 'workload-rate'}
+                        key={profile.name}
+                      >
+                        <span>{workloadLabel(profile.name)}</span>
+                        <strong>{profile.tasksPerMinute ?? manualTasksPerMinute}</strong>
+                      </span>
+                    ))}
+                  </div>
+                  {workload === 'manual' && (
+                    <label className="manual-workload-input">
+                      <span>Manual rate · tasks per minute (1–10,000)</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max={MANUAL_TASKS_PER_MINUTE_MAX}
+                        step="1"
+                        value={manualTasksPerMinute}
+                        onChange={(event) => setManualTasksPerMinute(Number(event.target.value))}
+                        disabled={busy || state !== 'idle'}
+                        aria-invalid={!validManualWorkload}
+                      />
+                      {!validManualWorkload && (
+                        <small role="alert">Enter a whole number from 1 to 10,000.</small>
+                      )}
+                    </label>
+                  )}
+                  {workload !== 'manual' && (
+                    <small>Extreme sends 20 tasks/second (1,200/minute), the highest preset.</small>
+                  )}
+                </div>
+              </div>
               {(error || notice) && (
                 <p className={`feedback-message${error ? ' feedback-message--error' : ''}`} role={error ? 'alert' : 'status'}>
                   <Icon name={error ? 'error' : 'check_circle'} />
@@ -758,7 +957,8 @@ function Dashboard({
               <Kpi icon="add_task" label="Tasks Generated" value={loading ? '…' : tasksGenerated.toLocaleString()} note={tasksGenerated ? 'Tasks in this simulation run' : 'Generate tasks to begin'} />
               <Kpi icon="task_alt" label="Tasks Completed" value={loading ? '…' : (metrics?.tasks_completed ?? 0).toLocaleString()} note="Completed by simulated nodes" />
               <Kpi icon="pending_actions" label="Tasks Pending" value={loading ? '…' : tasksPending.toLocaleString()} note={`${metrics?.tasks_running ?? 0} currently running`} />
-              <Kpi icon="error_outline" label="Tasks Failed" value={loading ? '…' : (metrics?.tasks_rejected ?? 0).toLocaleString()} note="Rejected by capacity or deadline checks" />
+              <Kpi icon="error_outline" label="Tasks Failed" value={loading ? '…' : (metrics?.tasks_failed ?? 0).toLocaleString()} note="Interrupted by simulated node outages" />
+              <Kpi icon="block" label="Tasks Rejected" value={loading ? '…' : (metrics?.tasks_rejected ?? 0).toLocaleString()} note="No node met availability, capacity, or deadline checks" />
             </section>
 
             <section className="primary-grid" aria-label="City twin and compute nodes">
@@ -768,7 +968,9 @@ function Dashboard({
                     <Icon name="location_city" className="heading-icon" />
                     <div><h2>Smart City Digital Twin</h2><p>MapCN geographic telemetry · Mumbai</p></div>
                   </div>
-                  <span className="future-tag">9 sensors · 4 compute nodes</span>
+                  <span className="future-tag">
+                    9 sensors · {nodes.length ? describeNodeCounts(nodes) : 'Loading node configuration'}
+                  </span>
                 </div>
                 <div className="digital-twin-viewport" id="city-map-viewport" role="region" aria-label="Interactive Mumbai smart city map">
                   <SmartCityMap
@@ -778,7 +980,7 @@ function Dashboard({
                     allocation={allocation}
                     taskFailure={taskFailure}
                     busy={busy}
-                    canGenerate={connection === 'connected'}
+                    canGenerate={connection === 'connected' && (workload !== 'manual' || validManualWorkload)}
                     onSelectDevice={setSelectedDevice}
                     onClearSelection={() => setSelectedDevice(null)}
                     onGenerateTask={generateFromSensor}
@@ -791,7 +993,14 @@ function Dashboard({
                 <div className="panel-heading">
                   <div className="heading-with-icon">
                     <Icon name="hub" className="heading-icon" />
-                    <div><h2>Compute Nodes</h2><p>{onlineNodes} online · {activeNodes} processing tasks</p></div>
+                    <div>
+                      <h2>Compute Nodes</h2>
+                      <p>
+                        {nodes.length
+                          ? `${describeNodeCounts(nodes)} · ${onlineNodes} online · ${activeNodes} processing`
+                          : 'Loading configured nodes…'}
+                      </p>
+                    </div>
                   </div>
                   <span className="panel-count" aria-label={`${activeNodes} active nodes`}>{activeNodes} active</span>
                 </div>
@@ -917,7 +1126,9 @@ function Kpi({
 
 function NodeCard({ node }: { node: NodeTelemetry }) {
   const tone = nodeTones[node.node_type]
-  const status = !node.online ? 'OFFLINE' : node.active_task_id ? 'PROCESSING' : 'IDLE'
+  const status = !node.online
+    ? node.faulted ? 'REPAIRING' : 'OFFLINE'
+    : node.active_task_id ? 'PROCESSING' : 'IDLE'
   return (
     <article className={`node-card${node.online ? '' : ' node-card--offline'}`}>
       <div className={`node-indicator node-indicator--${tone}`} aria-hidden="true" />
@@ -949,7 +1160,15 @@ function algorithmLabel(algorithm: Algorithm): string {
     case 'least_loaded':
       return 'Least Loaded'
     case 'adaptive_fog_cloud':
-      return 'Adaptive Fog–Cloud'
+      return 'Weighted Sum Model (WSM)'
+    case 'fuzzy_logic':
+      return 'Fuzzy Logic'
+    case 'topsis':
+      return 'TOPSIS'
+    case 'ant_colony':
+      return 'Ant Colony Optimization (ACO)'
+    case 'particle_swarm':
+      return 'Particle Swarm Optimization (PSO)'
   }
 }
 

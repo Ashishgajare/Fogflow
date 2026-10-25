@@ -3,9 +3,19 @@ export type Algorithm =
   | 'weighted_round_robin'
   | 'least_loaded'
   | 'adaptive_fog_cloud'
-export type Workload = 'light' | 'normal' | 'heavy'
+  | 'fuzzy_logic'
+  | 'topsis'
+  | 'ant_colony'
+  | 'particle_swarm'
+export type Workload = 'light' | 'normal' | 'heavy' | 'extreme' | 'manual'
 export type SimulationState = 'idle' | 'running' | 'paused' | 'reset'
-export type TaskStatus = 'pending' | 'queued' | 'running' | 'completed' | 'rejected'
+export type TaskStatus =
+  | 'pending'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'rejected'
 export type BenchmarkStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 
 export type BenchmarkAlgorithm =
@@ -14,13 +24,24 @@ export type BenchmarkAlgorithm =
   | 'least_loaded'
   | 'min_min'
   | 'adaptive_fog_cloud'
+  | 'fuzzy_logic'
+  | 'topsis'
+  | 'ant_colony'
+  | 'particle_swarm'
 
 export interface BenchmarkConfiguration {
   duration_seconds: number
   workload: Workload
+  manual_tasks_per_minute?: number | null
   task_count: number
   algorithm_order: BenchmarkAlgorithm[]
   adaptive_weights: Record<string, number>
+  failure_model?: {
+    name: string
+    mean_node_uptime_seconds: number
+    mean_node_repair_seconds: number
+    seed: number
+  }
   min_min_batch_seconds: number
   workload_generator: string
   node_configs: Array<{
@@ -104,6 +125,7 @@ export interface NodeTelemetry {
   projected_utilization: number
   queue_length: number
   online: boolean
+  faulted?: boolean
   active_task_id: string | null
 }
 
@@ -143,11 +165,13 @@ export interface MetricsResponse {
   state: SimulationState
   algorithm: Algorithm
   workload: Workload
+  manual_tasks_per_minute: number | null
   simulation_clock_seconds: number
   task_count: number
   tasks_completed: number
   tasks_running: number
   tasks_queued: number
+  tasks_failed: number
   tasks_rejected: number
   average_response_time_ms: number | null
   task_counts_by_sensor: Record<string, number>
@@ -160,6 +184,7 @@ export interface SimulationResponse {
     state: SimulationState
     algorithm: Algorithm
     workload: Workload
+    manual_tasks_per_minute: number | null
     simulation_clock_seconds: number
   }
 }
@@ -222,6 +247,13 @@ export function getNodes(signal?: AbortSignal): Promise<NodesResponse> {
   return request('/api/nodes', { signal })
 }
 
+export function configureFogNodes(fogNodeCount: number): Promise<NodesResponse> {
+  return request('/api/nodes/configure', {
+    method: 'POST',
+    body: JSON.stringify({ fog_node_count: fogNodeCount }),
+  })
+}
+
 export function getTasks(
   limit = 50,
   offset = 0,
@@ -258,10 +290,17 @@ export function generateTask(
 export function startSimulation(
   workload: Workload,
   algorithm: Algorithm,
+  manualTasksPerMinute?: number,
 ): Promise<SimulationResponse> {
   return request('/api/simulation/start', {
     method: 'POST',
-    body: JSON.stringify({ workload, algorithm }),
+    body: JSON.stringify({
+      workload,
+      algorithm,
+      ...(workload === 'manual'
+        ? { manual_tasks_per_minute: manualTasksPerMinute }
+        : {}),
+    }),
   })
 }
 
@@ -280,12 +319,16 @@ export function resetSimulation(): Promise<SimulationResponse> {
 export function startBenchmark(
   durationSeconds: number,
   workload: Workload,
+  manualTasksPerMinute?: number,
 ): Promise<{ benchmark: BenchmarkRecord }> {
   return request('/api/benchmarks', {
     method: 'POST',
     body: JSON.stringify({
       duration_seconds: durationSeconds,
       workload,
+      ...(workload === 'manual'
+        ? { manual_tasks_per_minute: manualTasksPerMinute }
+        : {}),
     }),
   })
 }

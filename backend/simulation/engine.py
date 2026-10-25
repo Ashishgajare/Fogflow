@@ -6,16 +6,25 @@ from datetime import datetime, timezone
 from typing import Any
 
 from simulation.database import SimulationDatabase
+from simulation.faults import (
+    NodeFaultSchedule,
+    create_node_fault_schedules,
+)
 from simulation.models import (
     DEFAULT_NODE_CONFIGS,
+    FOG_NODE_COUNT_MAX,
+    FOG_NODE_COUNT_MIN,
     TASK_TEMPLATES,
-    WORKLOAD_PROFILES,
+    WORKLOAD_NAMES,
     Node,
     Task,
+    create_node_configs,
     simulation_iso_time,
     utc_now_iso,
+    workload_arrival_rate,
 )
 from simulation.scheduler import (
+    SchedulerState,
     SchedulingError,
     choose_candidate,
     eligible_candidates,
@@ -44,8 +53,8 @@ def _number(value: Any, field_name: str, *, minimum: float, strict: bool = False
 
 def validate_node_configs(configs: list[dict[str, Any]] | None) -> list[Node]:
     raw_configs = DEFAULT_NODE_CONFIGS if configs is None else configs
-    if not isinstance(raw_configs, (list, tuple)) or len(raw_configs) != 4:
-        raise SimulationError("Node configuration must contain exactly four nodes.")
+    if not isinstance(raw_configs, (list, tuple)):
+        raise SimulationError("Node configuration must be a list or tuple.")
 
     nodes: list[Node] = []
     ids: set[str] = set()
@@ -89,10 +98,13 @@ def validate_node_configs(configs: list[dict[str, Any]] | None) -> list[Node]:
                 online=config.get("online", True),
             )
         )
-    if sum(node.node_type == "fog" for node in nodes) != 3 or sum(
-        node.node_type == "cloud" for node in nodes
-    ) != 1:
-        raise SimulationError("Node configuration requires three fog nodes and one cloud server.")
+    fog_count = sum(node.node_type == "fog" for node in nodes)
+    cloud_count = sum(node.node_type == "cloud" for node in nodes)
+    if not FOG_NODE_COUNT_MIN <= fog_count <= FOG_NODE_COUNT_MAX or cloud_count != 1:
+        raise SimulationError(
+            f"Node configuration requires {FOG_NODE_COUNT_MIN} to "
+            f"{FOG_NODE_COUNT_MAX} fog nodes and one cloud server."
+        )
     return nodes
 
 
@@ -118,12 +130,15 @@ class SimulationEngine:
         self._generator_count = 0
         self._next_arrival_clock: float | None = None
         self._round_robin_offset = 0
+        self._node_faults: dict[str, NodeFaultSchedule] = {}
+        self._scheduler_state = SchedulerState(0)
         self.nodes: list[Node] = []
         self.tasks: dict[str, Task] = {}
         self.simulation_clock = 0.0
         self.state = "idle"
         self.algorithm = "adaptive_fog_cloud"
         self.workload = "normal"
+        self.manual_tasks_per_minute: int | None = None
         self.started_at: str | None = None
         self.epoch = datetime.now(timezone.utc)
         self.run_id = ""
@@ -137,11 +152,14 @@ class SimulationEngine:
         self.state = "idle"
         self.algorithm = "adaptive_fog_cloud"
         self.workload = "normal"
+        self.manual_tasks_per_minute = None
         self.started_at = None
         self.epoch = datetime.now(timezone.utc)
         self._generator_count = 0
         self._next_arrival_clock = None
         self._round_robin_offset = 0
+        self._scheduler_state = SchedulerState(0)
+        self._node_faults = {}
         self.database.create_run(
             self.run_id,
             self.algorithm,
@@ -195,6 +213,7 @@ class SimulationEngine:
         workload: str = "normal",
         algorithm: str = "adaptive_fog_cloud",
         weights: dict[str, float] | None = None,
+        manual_tasks_per_minute: int | None = None,
     ) -> dict[str, Any]:
         with self._condition:
             self._sync_wall_clock_locked()
@@ -202,19 +221,29 @@ class SimulationEngine:
                 raise SimulationError("Simulation is already running.", 409)
             if self.state == "paused":
                 raise SimulationError("Simulation is paused; use the resume endpoint.", 409)
-            if not isinstance(workload, str) or workload not in WORKLOAD_PROFILES:
-                raise SimulationError("workload must be light, normal, or heavy.")
+            if not isinstance(workload, str) or workload not in WORKLOAD_NAMES:
+                raise SimulationError("workload must be light, normal, heavy, extreme, or manual.")
+            try:
+                rate = workload_arrival_rate(workload, manual_tasks_per_minute)
+            except ValueError as exc:
+                raise SimulationError(str(exc)) from exc
             try:
                 algorithm = validate_algorithm(algorithm)
                 validated_weights = validate_weights(weights) if weights is not None else self.weights
             except SchedulingError as exc:
                 raise SimulationError(str(exc)) from exc
+            self._node_faults = create_node_fault_schedules(
+                self.nodes, uuid.UUID(self.run_id).int & 0xFFFFFFFF
+            )
+            self._scheduler_state = SchedulerState(
+                uuid.UUID(self.run_id).int & 0xFFFFFFFF
+            )
             self.algorithm = algorithm
             self.workload = workload
+            self.manual_tasks_per_minute = manual_tasks_per_minute
             self.weights = validated_weights
             self.started_at = utc_now_iso()
             self.state = "running"
-            rate = WORKLOAD_PROFILES[self.workload]["arrival_rate_per_second"]
             self._next_arrival_clock = self.simulation_clock + 1.0 / rate
             for node in self.nodes:
                 self._start_next_locked(node)
@@ -222,6 +251,21 @@ class SimulationEngine:
             self._persist_run()
             self._ensure_worker()
             return self._snapshot_locked()
+
+    def configure_fog_node_count(self, fog_node_count: int) -> list[dict[str, Any]]:
+        try:
+            node_configs = create_node_configs(fog_node_count)
+        except ValueError as exc:
+            raise SimulationError(str(exc)) from exc
+        with self._condition:
+            self._sync_wall_clock_locked()
+            if self.state != "idle" or self.tasks:
+                raise SimulationError(
+                    "Reset the simulation before changing the fog node count.", 409
+                )
+            self._initial_node_configs = node_configs
+            self.nodes = validate_node_configs(node_configs)
+            return [node.to_dict(self.tasks) for node in self.nodes]
 
     def pause(self) -> dict[str, Any]:
         with self._condition:
@@ -275,9 +319,13 @@ class SimulationEngine:
     def _advance_locked(self, duration: float) -> None:
         if duration <= 0:
             return
+        pending_tasks: dict[str, Task] = {}
+        pending_decisions: list[dict[str, Any]] = []
         target_clock = self.simulation_clock + duration
         if self._next_arrival_clock is None:
-            rate = WORKLOAD_PROFILES[self.workload]["arrival_rate_per_second"]
+            rate = workload_arrival_rate(
+                self.workload, self.manual_tasks_per_minute
+            )
             self._next_arrival_clock = self.simulation_clock + 1.0 / rate
 
         while True:
@@ -287,10 +335,17 @@ class SimulationEngine:
                 if node.active_task_finishes_at is not None
             ]
             next_completion = min(completions) if completions else None
+            next_fault = min(
+                (
+                    schedule.next_transition_at
+                    for schedule in self._node_faults.values()
+                ),
+                default=None,
+            )
             next_arrival = self._next_arrival_clock
             possible_events = [
                 event
-                for event in (next_completion, next_arrival)
+                for event in (next_completion, next_fault, next_arrival)
                 if event is not None and event <= target_clock
             ]
             if not possible_events:
@@ -303,17 +358,58 @@ class SimulationEngine:
                     node.active_task_finishes_at is not None
                     and node.active_task_finishes_at <= event_clock + 1e-12
                 ):
-                    self._complete_active_locked(node)
+                    self._complete_active_locked(node, pending_tasks)
+
+            for node in self.nodes:
+                schedule = self._node_faults.get(node.node_id)
+                if (
+                    schedule is None
+                    or schedule.next_transition_at > event_clock + 1e-12
+                ):
+                    continue
+                if schedule.transition(event_clock):
+                    node.online = False
+                    if node.active_task_id is not None:
+                        failed_task = self.tasks[node.active_task_id]
+                        failed_task.status = "failed"
+                        failed_task.allocation_explanation += (
+                            f" Task failed when {node.name} experienced a transient "
+                            "node outage during processing."
+                        )
+                        self._save_task_locked(failed_task, pending_tasks)
+                        node.active_task_id = None
+                        node.active_task_started_at = None
+                        node.active_task_finishes_at = None
+                else:
+                    node.online = True
+                    self._start_next_locked(node, pending_tasks)
 
             if (
                 self._next_arrival_clock is not None
                 and self._next_arrival_clock <= event_clock + 1e-12
             ):
-                self._generate_profile_task_locked(event_clock)
-                rate = WORKLOAD_PROFILES[self.workload]["arrival_rate_per_second"]
+                self._generate_profile_task_locked(
+                    event_clock, pending_tasks, pending_decisions
+                )
+                rate = workload_arrival_rate(
+                    self.workload, self.manual_tasks_per_minute
+                )
                 self._next_arrival_clock += 1.0 / rate
 
         self.simulation_clock = target_clock
+        if pending_tasks or pending_decisions:
+            self.database.save_simulation_batch(
+                self.run_id,
+                [
+                    (
+                        task.to_dict(),
+                        task.arrival_clock,
+                        task.completion_clock,
+                    )
+                    for task in pending_tasks.values()
+                ],
+                pending_decisions,
+            )
         self._persist_run()
 
     def _new_task(self, spec: dict[str, Any], arrival_clock: float) -> Task:
@@ -330,11 +426,16 @@ class SimulationEngine:
             arrival_clock=arrival_clock,
         )
 
-    def _generate_profile_task_locked(self, arrival_clock: float) -> None:
+    def _generate_profile_task_locked(
+        self,
+        arrival_clock: float,
+        pending_tasks: dict[str, Task] | None = None,
+        pending_decisions: list[dict[str, Any]] | None = None,
+    ) -> None:
         template = TASK_TEMPLATES[self._generator_count % len(TASK_TEMPLATES)]
         self._generator_count += 1
         task = self._new_task(dict(template), arrival_clock)
-        self._schedule_locked(task)
+        self._schedule_locked(task, pending_tasks, pending_decisions)
 
     def generate_tasks(self, specifications: list[dict[str, Any]]) -> list[dict[str, Any]]:
         with self._condition:
@@ -360,7 +461,55 @@ class SimulationEngine:
                 specifications.append(dict(template))
             return specifications
 
-    def _schedule_locked(self, task: Task) -> None:
+    def _save_task_locked(
+        self, task: Task, pending_tasks: dict[str, Task] | None
+    ) -> None:
+        if pending_tasks is None:
+            self.database.save_task(
+                self.run_id,
+                task.to_dict(),
+                task.arrival_clock,
+                task.completion_clock,
+            )
+        else:
+            pending_tasks[task.task_id] = task
+
+    def _save_decision_locked(
+        self,
+        task: Task,
+        selected_node_id: str | None,
+        explanation: str,
+        candidates: list[dict[str, Any]],
+        pending_decisions: list[dict[str, Any]] | None,
+    ) -> None:
+        if pending_decisions is None:
+            self.database.save_decision(
+                self.run_id,
+                task.task_id,
+                self.algorithm,
+                selected_node_id,
+                explanation,
+                candidates,
+                self.simulation_clock,
+            )
+        else:
+            pending_decisions.append(
+                {
+                    "task_id": task.task_id,
+                    "algorithm": self.algorithm,
+                    "selected_node_id": selected_node_id,
+                    "explanation": explanation,
+                    "candidates": candidates,
+                    "decision_clock": self.simulation_clock,
+                }
+            )
+
+    def _schedule_locked(
+        self,
+        task: Task,
+        pending_tasks: dict[str, Task] | None = None,
+        pending_decisions: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.tasks[task.task_id] = task
         candidates, excluded = eligible_candidates(
             self.nodes, self.tasks, task, self.simulation_clock
@@ -383,15 +532,13 @@ class SimulationEngine:
                 "Task rejected: no online node satisfies capacity and deadline "
                 f"constraints. {detail}"
             )
-            self.database.save_task(self.run_id, task.to_dict(), task.arrival_clock)
-            self.database.save_decision(
-                self.run_id,
-                task.task_id,
-                self.algorithm,
+            self._save_task_locked(task, pending_tasks)
+            self._save_decision_locked(
+                task,
                 None,
                 task.allocation_explanation,
                 candidate_records,
-                self.simulation_clock,
+                pending_decisions,
             )
             return
 
@@ -401,6 +548,7 @@ class SimulationEngine:
                 candidates,
                 self._round_robin_offset,
                 self.weights,
+                self._scheduler_state,
             )
         except SchedulingError as exc:
             raise SimulationError(str(exc)) from exc
@@ -433,18 +581,18 @@ class SimulationEngine:
             task.status = "queued"
             node.queue.append(task.task_id)
 
-        self.database.save_task(self.run_id, task.to_dict(), task.arrival_clock)
-        self.database.save_decision(
-            self.run_id,
-            task.task_id,
-            self.algorithm,
+        self._save_task_locked(task, pending_tasks)
+        self._save_decision_locked(
+            task,
             node.node_id,
             reason,
             candidate_records,
-            self.simulation_clock,
+            pending_decisions,
         )
 
-    def _complete_active_locked(self, node: Node) -> None:
+    def _complete_active_locked(
+        self, node: Node, pending_tasks: dict[str, Task] | None = None
+    ) -> None:
         if node.active_task_id is None:
             return
         task = self.tasks[node.active_task_id]
@@ -454,19 +602,21 @@ class SimulationEngine:
         task.actual_response_time_ms = (
             self.simulation_clock - task.arrival_clock
         ) * 1000.0
-        self.database.save_task(
-            self.run_id,
-            task.to_dict(),
-            task.arrival_clock,
-            task.completion_clock,
-        )
+        self._save_task_locked(task, pending_tasks)
         node.active_task_id = None
         node.active_task_started_at = None
         node.active_task_finishes_at = None
-        self._start_next_locked(node)
+        self._start_next_locked(node, pending_tasks)
 
-    def _start_next_locked(self, node: Node) -> None:
-        if self.state != "running" or node.active_task_id is not None or not node.queue:
+    def _start_next_locked(
+        self, node: Node, pending_tasks: dict[str, Task] | None = None
+    ) -> None:
+        if (
+            self.state != "running"
+            or not node.online
+            or node.active_task_id is not None
+            or not node.queue
+        ):
             return
         task_id = node.queue.pop(0)
         task = self.tasks[task_id]
@@ -478,12 +628,33 @@ class SimulationEngine:
             + node.network_latency_ms / 1000.0
             + task.cpu_demand / node.processing_rate
         )
-        self.database.save_task(self.run_id, task.to_dict(), task.arrival_clock)
+        self._save_task_locked(task, pending_tasks)
 
     def nodes_snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             self._sync_wall_clock_locked()
-            return [node.to_dict(self.tasks) for node in self.nodes]
+            return [self._node_telemetry_locked(node) for node in self.nodes]
+
+    def _node_telemetry_locked(self, node: Node) -> dict[str, Any]:
+        record = node.to_dict(self.tasks)
+        schedule = self._node_faults.get(node.node_id)
+        record["faulted"] = schedule.is_down if schedule is not None else False
+        return record
+
+    def node_configs_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "id": node.node_id,
+                    "name": node.name,
+                    "node_type": node.node_type,
+                    "processing_capacity": node.processing_capacity,
+                    "processing_rate": node.processing_rate,
+                    "network_latency_ms": node.network_latency_ms,
+                    "online": node.online,
+                }
+                for node in self.nodes
+            ]
 
     def tasks_snapshot(
         self,
@@ -524,17 +695,19 @@ class SimulationEngine:
                 "state": self.state,
                 "algorithm": self.algorithm,
                 "workload": self.workload,
+                "manual_tasks_per_minute": self.manual_tasks_per_minute,
                 "simulation_clock_seconds": self.simulation_clock,
                 "task_count": len(records),
                 "tasks_completed": sum(task["status"] == "completed" for task in records),
                 "tasks_running": sum(task["status"] == "running" for task in records),
                 "tasks_queued": sum(task["status"] == "queued" for task in records),
+                "tasks_failed": sum(task["status"] == "failed" for task in records),
                 "tasks_rejected": sum(task["status"] == "rejected" for task in records),
                 "average_response_time_ms": (
                     sum(completed) / len(completed) if completed else None
                 ),
                 "task_counts_by_sensor": task_counts_by_sensor,
-                "nodes": [node.to_dict(self.tasks) for node in self.nodes],
+                "nodes": [self._node_telemetry_locked(node) for node in self.nodes],
             }
 
     def _snapshot_locked(self) -> dict[str, Any]:
@@ -543,5 +716,6 @@ class SimulationEngine:
             "state": self.state,
             "algorithm": self.algorithm,
             "workload": self.workload,
+            "manual_tasks_per_minute": self.manual_tasks_per_minute,
             "simulation_clock_seconds": self.simulation_clock,
         }

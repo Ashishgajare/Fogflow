@@ -5,12 +5,19 @@ from werkzeug.exceptions import BadRequest, UnsupportedMediaType
 
 from simulation.benchmark import BenchmarkManager
 from simulation.engine import SimulationEngine, SimulationError, _number
-from simulation.models import WORKLOAD_PROFILES
+from simulation.models import WORKLOAD_NAMES
 from simulation.scheduler import ALGORITHMS, SchedulingError
 
 
 api = Blueprint("simulation_api", __name__)
-VALID_TASK_STATUSES = {"pending", "queued", "running", "completed", "rejected"}
+VALID_TASK_STATUSES = {
+    "pending",
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "rejected",
+}
 TASK_FIELDS = {
     "source_sensor_id",
     "task_type",
@@ -88,6 +95,19 @@ def get_nodes():
     return jsonify(nodes=_engine().nodes_snapshot())
 
 
+@api.post("/nodes/configure")
+def configure_nodes():
+    body = _json_object()
+    if set(body) != {"fog_node_count"}:
+        raise SimulationError("Only fog_node_count is accepted.")
+    fog_node_count = body["fog_node_count"]
+    if isinstance(fog_node_count, bool) or not isinstance(fog_node_count, int):
+        raise SimulationError("fog_node_count must be an integer.")
+    nodes = _engine().configure_fog_node_count(fog_node_count)
+    _benchmarks().set_node_configs(_engine().node_configs_snapshot())
+    return jsonify(nodes=nodes)
+
+
 @api.get("/tasks")
 def get_tasks():
     limit_value = request.args.get("limit", "50")
@@ -117,15 +137,20 @@ def get_metrics():
 @api.post("/benchmarks")
 def start_benchmark():
     body = _json_object()
-    if set(body) - {"duration_seconds", "workload"}:
-        raise SimulationError("Only duration_seconds and workload are accepted.")
+    if set(body) - {"duration_seconds", "workload", "manual_tasks_per_minute"}:
+        raise SimulationError(
+            "Only duration_seconds, workload, and manual_tasks_per_minute are accepted."
+        )
     duration = body.get("duration_seconds", 60)
     workload = body.get("workload", "normal")
+    manual_tasks_per_minute = body.get("manual_tasks_per_minute")
     if isinstance(duration, bool) or not isinstance(duration, int):
         raise SimulationError("duration_seconds must be an integer.")
-    if not isinstance(workload, str):
-        raise SimulationError("workload must be light, normal, or heavy.")
-    benchmark = _benchmarks().start(duration, workload)
+    if not isinstance(workload, str) or workload not in WORKLOAD_NAMES:
+        raise SimulationError("workload must be light, normal, heavy, extreme, or manual.")
+    benchmark = _benchmarks().start(
+        duration, workload, manual_tasks_per_minute
+    )
     return jsonify(benchmark=benchmark), 202
 
 
@@ -179,21 +204,31 @@ def generate_tasks():
 @api.post("/simulation/start")
 def start_simulation():
     body = _json_object()
-    if set(body) - {"workload", "algorithm", "weights"}:
-        raise SimulationError("Only workload, algorithm, and weights are accepted.")
+    if set(body) - {
+        "workload",
+        "algorithm",
+        "weights",
+        "manual_tasks_per_minute",
+    }:
+        raise SimulationError(
+            "Only workload, algorithm, weights, and manual_tasks_per_minute are accepted."
+        )
     workload = body.get("workload", "normal")
     algorithm = body.get("algorithm", "adaptive_fog_cloud")
     weights = body.get("weights")
-    if not isinstance(workload, str) or workload not in WORKLOAD_PROFILES:
-        raise SimulationError("workload must be light, normal, or heavy.")
+    manual_tasks_per_minute = body.get("manual_tasks_per_minute")
+    if not isinstance(workload, str) or workload not in WORKLOAD_NAMES:
+        raise SimulationError("workload must be light, normal, heavy, extreme, or manual.")
     if not isinstance(algorithm, str) or algorithm not in ALGORITHMS:
         raise SimulationError(
-            "algorithm must be round_robin, least_loaded, or adaptive_fog_cloud."
+            "algorithm must be one of the supported Group 1 or Group 2 scheduler IDs."
         )
     if weights is not None and not isinstance(weights, dict):
         raise SimulationError("weights must be a JSON object.")
     try:
-        result = _engine().start(workload, algorithm, weights)
+        result = _engine().start(
+            workload, algorithm, weights, manual_tasks_per_minute
+        )
     except SchedulingError as exc:
         raise SimulationError(str(exc)) from exc
     return jsonify(simulation=result)

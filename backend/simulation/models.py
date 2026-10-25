@@ -3,44 +3,48 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-DEFAULT_NODE_CONFIGS = (
-    {
-        "id": "fog-1",
-        "name": "Fog Node 1",
-        "node_type": "fog",
-        "processing_capacity": 100.0,
-        "processing_rate": 25.0,
-        "network_latency_ms": 4.0,
-        "online": True,
-    },
-    {
-        "id": "fog-2",
-        "name": "Fog Node 2",
-        "node_type": "fog",
-        "processing_capacity": 120.0,
-        "processing_rate": 30.0,
-        "network_latency_ms": 7.0,
-        "online": True,
-    },
-    {
-        "id": "fog-3",
-        "name": "Fog Node 3",
-        "node_type": "fog",
-        "processing_capacity": 80.0,
-        "processing_rate": 20.0,
-        "network_latency_ms": 12.0,
-        "online": True,
-    },
-    {
-        "id": "cloud-1",
-        "name": "Cloud Server",
-        "node_type": "cloud",
-        "processing_capacity": 500.0,
-        "processing_rate": 15.0,
-        "network_latency_ms": 38.0,
-        "online": True,
-    },
+FOG_NODE_COUNT_MIN = 1
+FOG_NODE_COUNT_MAX = 75
+FOG_NODE_PROFILES = (
+    {"processing_capacity": 100.0, "processing_rate": 25.0, "network_latency_ms": 4.0},
+    {"processing_capacity": 120.0, "processing_rate": 30.0, "network_latency_ms": 7.0},
+    {"processing_capacity": 80.0, "processing_rate": 20.0, "network_latency_ms": 12.0},
 )
+CLOUD_NODE_CONFIG = {
+    "id": "cloud-1",
+    "name": "Cloud Server",
+    "node_type": "cloud",
+    "processing_capacity": 500.0,
+    "processing_rate": 15.0,
+    "network_latency_ms": 38.0,
+    "online": True,
+}
+
+
+def create_node_configs(fog_node_count: int) -> list[dict[str, Any]]:
+    if (
+        isinstance(fog_node_count, bool)
+        or not isinstance(fog_node_count, int)
+        or not FOG_NODE_COUNT_MIN <= fog_node_count <= FOG_NODE_COUNT_MAX
+    ):
+        raise ValueError(
+            f"fog_node_count must be an integer between "
+            f"{FOG_NODE_COUNT_MIN} and {FOG_NODE_COUNT_MAX}."
+        )
+    fog_nodes = [
+        {
+            "id": f"fog-{index + 1}",
+            "name": f"Fog Node {index + 1}",
+            "node_type": "fog",
+            **FOG_NODE_PROFILES[index % len(FOG_NODE_PROFILES)],
+            "online": True,
+        }
+        for index in range(fog_node_count)
+    ]
+    return [*fog_nodes, dict(CLOUD_NODE_CONFIG)]
+
+
+DEFAULT_NODE_CONFIGS = tuple(create_node_configs(3))
 
 DEFAULT_ADAPTIVE_WEIGHTS = {
     "response_time": 0.4,
@@ -49,10 +53,40 @@ DEFAULT_ADAPTIVE_WEIGHTS = {
 }
 
 WORKLOAD_PROFILES = {
-    "light": {"arrival_rate_per_second": 0.5},
-    "normal": {"arrival_rate_per_second": 2.0},
-    "heavy": {"arrival_rate_per_second": 5.0},
+    "light": {"arrival_rate_per_second": 1.0},
+    "normal": {"arrival_rate_per_second": 4.0},
+    "heavy": {"arrival_rate_per_second": 10.0},
+    "extreme": {"arrival_rate_per_second": 20.0},
 }
+MANUAL_TASKS_PER_MINUTE_MIN = 1
+MANUAL_TASKS_PER_MINUTE_MAX = 10_000
+WORKLOAD_NAMES = (*WORKLOAD_PROFILES, "manual")
+
+
+def workload_arrival_rate(
+    workload: str,
+    manual_tasks_per_minute: int | None = None,
+) -> float:
+    if workload == "manual":
+        if (
+            isinstance(manual_tasks_per_minute, bool)
+            or not isinstance(manual_tasks_per_minute, int)
+            or not MANUAL_TASKS_PER_MINUTE_MIN
+            <= manual_tasks_per_minute
+            <= MANUAL_TASKS_PER_MINUTE_MAX
+        ):
+            raise ValueError(
+                "manual_tasks_per_minute must be an integer between "
+                f"{MANUAL_TASKS_PER_MINUTE_MIN} and {MANUAL_TASKS_PER_MINUTE_MAX}."
+            )
+        return manual_tasks_per_minute / 60.0
+    if workload not in WORKLOAD_PROFILES:
+        raise ValueError("workload must be light, normal, heavy, extreme, or manual.")
+    if manual_tasks_per_minute is not None:
+        raise ValueError(
+            "manual_tasks_per_minute is only accepted for the manual workload."
+        )
+    return WORKLOAD_PROFILES[workload]["arrival_rate_per_second"]
 
 TASK_TEMPLATES = (
     {
@@ -229,6 +263,7 @@ class AllocationCandidate:
     processing_time_ms: float
     response_time_ms: float
     completion_time_seconds: float
+    deadline_urgency: float
 
 
 def simulation_iso_time(epoch: datetime, clock_seconds: float) -> str:

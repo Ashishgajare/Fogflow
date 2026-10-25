@@ -41,7 +41,7 @@ const METRICS: MetricDefinition[] = [
   { key: 'average_node_utilization_percent', label: 'Average node utilization', unit: '%', direction: 'higher' },
   { key: 'load_imbalance_percent', label: 'Load imbalance', unit: 'percentage points', direction: 'lower' },
   { key: 'completed_count', label: 'Tasks completed', unit: 'tasks', direction: 'higher', decimals: 0 },
-  { key: 'failed_count', label: 'Tasks failed', unit: 'tasks', direction: 'lower', decimals: 0 },
+  { key: 'failed_count', label: 'Tasks failed or rejected', unit: 'tasks', direction: 'lower', decimals: 0 },
   { key: 'deadline_misses', label: 'Deadline misses', unit: 'tasks', direction: 'lower', decimals: 0 },
   { key: 'cloud_offloading_rate_percent', label: 'Cloud offloading rate', unit: '% of generated tasks', direction: 'lower' },
   { key: 'makespan_seconds', label: 'Makespan', unit: 's', direction: 'lower' },
@@ -69,6 +69,29 @@ function formatValue(
     maximumFractionDigits: digits,
   })
   return unit ? `${formatted} ${unit}` : formatted
+}
+
+function shortAlgorithmLabel(algorithm: BenchmarkResult['algorithm']): string {
+  switch (algorithm) {
+    case 'round_robin':
+      return 'RR'
+    case 'weighted_round_robin':
+      return 'WRR'
+    case 'least_loaded':
+      return 'Least'
+    case 'adaptive_fog_cloud':
+      return 'WSM'
+    case 'min_min':
+      return 'Min-Min'
+    case 'fuzzy_logic':
+      return 'Fuzzy'
+    case 'topsis':
+      return 'TOPSIS'
+    case 'ant_colony':
+      return 'ACO'
+    case 'particle_swarm':
+      return 'PSO'
+  }
 }
 
 function rankMetric(
@@ -370,7 +393,8 @@ function AlgorithmComparison({
           </label>
           {selectedRun && (
             <span className={`benchmark-status benchmark-status--${selectedRun.status}`}>
-              {selectedRun.completed_experiments}/5 · {selectedRun.status}
+              {selectedRun.completed_experiments}/
+              {selectedRun.configuration.algorithm_order.length} · {selectedRun.status}
             </span>
           )}
         </section>
@@ -392,7 +416,7 @@ function AlgorithmComparison({
         <section className="panel comparison-empty">
           <span className="material-symbols-outlined" aria-hidden="true">query_stats</span>
           <h2>No benchmark results yet</h2>
-          <p>Run a five-algorithm benchmark to populate this comparison page.</p>
+          <p>Run a benchmark across both algorithm groups to populate this comparison page.</p>
           <button
             type="button"
             className="control-button control-button--generate"
@@ -444,7 +468,11 @@ function AlgorithmComparison({
               icon="task_alt"
               label="Prepared workload"
               value={configuration.task_count.toLocaleString()}
-              note={`tasks · ${selectedRun.workload} profile`}
+              note={
+                selectedRun.workload === 'manual'
+                  ? `tasks · manual rate ${configuration.manual_tasks_per_minute?.toLocaleString() ?? 'unknown'}/min`
+                  : `tasks · ${selectedRun.workload} profile`
+              }
             />
             <SummaryCard
               icon="schedule"
@@ -455,8 +483,14 @@ function AlgorithmComparison({
             <SummaryCard
               icon="checklist"
               label="Completed experiments"
-              value={`${selectedRun.completed_experiments} / 5`}
+              value={`${selectedRun.completed_experiments} / ${configuration.algorithm_order.length}`}
               note="all schedulers used the same arrivals"
+            />
+            <SummaryCard
+              icon="hub"
+              label="Compute nodes"
+              value={`${configuration.node_configs.length}`}
+              note={`${configuration.node_configs.filter((node) => node.node_type === 'fog').length} fog · ${configuration.node_configs.filter((node) => node.node_type === 'cloud').length} cloud`}
             />
             <SummaryCard
               icon="timer"
@@ -516,7 +550,7 @@ function AlgorithmComparison({
               unit="tasks"
               series={[
                 { key: 'completed_count', label: 'Completed', color: seriesColors[1], decimals: 0 },
-                { key: 'failed_count', label: 'Failed', color: '#ff858b', decimals: 0 },
+                { key: 'failed_count', label: 'Failed or rejected', color: '#ff858b', decimals: 0 },
                 { key: 'deadline_misses', label: 'Deadline misses', color: seriesColors[2], decimals: 0 },
               ]}
             />
@@ -567,13 +601,25 @@ function AlgorithmComparison({
                 <tbody>
                   {METRICS.map((metric) => {
                     const ranks = rankMetric(results, metric.key, metric.direction)
-                    const ranking = [...ranks.entries()]
+                    const rankedAlgorithms = [...ranks.entries()]
                       .sort((first, second) => first[1] - second[1])
+                    const ranking = rankedAlgorithms
                       .map(([algorithm, rank]) => {
                         const result = results.find((item) => item.algorithm === algorithm)
                         return `#${rank % 1 ? rank.toFixed(1) : rank} ${result?.algorithm_label ?? algorithm}`
                       })
                       .join(' · ')
+                    const rankingSummary = rankedAlgorithms
+                      .slice(0, 3)
+                      .map(([algorithm, rank]) => {
+                        const result = results.find((item) => item.algorithm === algorithm)
+                        return `#${rank % 1 ? rank.toFixed(1) : rank} ${result ? shortAlgorithmLabel(result.algorithm) : algorithm}`
+                      })
+                      .join(' · ')
+                    const rankingCell =
+                      rankedAlgorithms.length > 3
+                        ? `${rankingSummary} · +${rankedAlgorithms.length - 3}`
+                        : rankingSummary
                     const direction =
                       metric.direction === 'higher'
                         ? 'Higher'
@@ -594,7 +640,9 @@ function AlgorithmComparison({
                             )}
                           </td>
                         ))}
-                        <td>{ranking || 'Not measurable'}</td>
+                        <td title={ranking || undefined}>
+                          {rankingCell || 'Not measurable'}
+                        </td>
                       </tr>
                     )
                   })}
@@ -607,18 +655,30 @@ function AlgorithmComparison({
                         {scores.get(result.algorithm)?.toFixed(1) ?? '—'}
                       </td>
                     ))}
-                    <td>
+                    <td title={[...results]
+                      .sort(
+                        (first, second) =>
+                          (scores.get(second.algorithm) ?? 0) -
+                          (scores.get(first.algorithm) ?? 0),
+                      )
+                      .map(
+                        (result, index) =>
+                          `#${index + 1} ${result.algorithm_label}`,
+                      )
+                      .join(' · ')}>
                       {[...results]
                         .sort(
                           (first, second) =>
                             (scores.get(second.algorithm) ?? 0) -
                             (scores.get(first.algorithm) ?? 0),
                         )
+                        .slice(0, 3)
                         .map(
                           (result, index) =>
-                            `#${index + 1} ${result.algorithm_label}`,
+                            `#${index + 1} ${shortAlgorithmLabel(result.algorithm)}`,
                         )
                         .join(' · ')}
+                      {results.length > 3 ? ` · +${results.length - 3}` : ''}
                     </td>
                   </tr>
                 </tbody>
@@ -643,14 +703,15 @@ function AlgorithmComparison({
                 <li>
                   A deadline miss is either a task rejected for deadline
                   infeasibility or a completed task whose response exceeded
-                  its deadline. Failures count rejected tasks. Cloud
+                  its deadline. Failed or rejected tasks include node-outage
+                  interruptions and capacity or deadline rejections. Cloud
                   offloading is cloud-assigned tasks divided by generated
                   tasks; lower is only a fog-locality preference and is not
                   included in the overall score.
                 </li>
                 <li>
                   Overall score is the equally weighted mean of rank points
-                  across completed count (higher), failed tasks (lower),
+                  across completed count (higher), failed or rejected tasks (lower),
                   deadline misses (lower), average response time (lower),
                   throughput (higher), load imbalance (lower), and makespan
                   (lower). Best rank earns 100 and worst earns 0; ties share

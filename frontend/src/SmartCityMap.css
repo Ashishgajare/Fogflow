@@ -145,7 +145,7 @@
 }
 
 .map-marker-tooltip {
-  color: #dbe6f5;
+  color: #1f2937;
   display: flex;
   flex-direction: column;
   font-family: Inter, "Segoe UI", sans-serif;
@@ -155,11 +155,16 @@
 }
 
 .map-marker-tooltip strong {
-  color: #f0f6ff;
+  color: #111827;
   font-size: 12px;
 }
 
-.map-marker-tooltip small,
+.map-marker-tooltip small {
+  color: #4b5563;
+  font-size: 9px;
+  line-height: 1.4;
+}
+
 .smart-map-selection small,
 .smart-map-allocation small {
   color: #9caabe;

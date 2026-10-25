@@ -4,21 +4,64 @@ import {
   getBenchmark,
   getBenchmarks,
   startBenchmark,
+  type BenchmarkAlgorithm,
   type BenchmarkRecord,
+  type NodeTelemetry,
   type Workload,
 } from './api'
 
-const algorithmNames: Record<string, string> = {
+const algorithmNames: Record<BenchmarkAlgorithm, string> = {
   round_robin: 'Round Robin',
   weighted_round_robin: 'Weighted Round Robin',
   least_loaded: 'Least Loaded',
   min_min: 'Min-Min Scheduling',
-  adaptive_fog_cloud: 'Adaptive Fog–Cloud',
+  adaptive_fog_cloud: 'Weighted Sum Model (WSM)',
+  fuzzy_logic: 'Fuzzy Logic',
+  topsis: 'TOPSIS',
+  ant_colony: 'Ant Colony Optimization (ACO)',
+  particle_swarm: 'Particle Swarm Optimization (PSO)',
 }
+const algorithmGroups: Array<{
+  label: string
+  algorithms: BenchmarkAlgorithm[]
+}> = [
+  {
+    label: 'Group 1 · Current algorithms',
+    algorithms: [
+      'round_robin',
+      'weighted_round_robin',
+      'least_loaded',
+      'adaptive_fog_cloud',
+    ],
+  },
+  {
+    label: 'Benchmark-only baseline',
+    algorithms: ['min_min'],
+  },
+  {
+    label: 'Group 2 · Advanced algorithms',
+    algorithms: ['fuzzy_logic', 'topsis', 'ant_colony', 'particle_swarm'],
+  },
+]
+const MANUAL_TASKS_PER_MINUTE_MAX = 10_000
 
 interface BenchmarkPageProps {
   connected: boolean
+  loadingNodes: boolean
+  nodes: NodeTelemetry[]
   onViewComparison: (benchmarkId: string) => void
+}
+
+function describeNodeCounts(nodeConfigs: BenchmarkRecord['configuration']['node_configs']): string {
+  const fogCount = nodeConfigs.filter((node) => node.node_type === 'fog').length
+  const cloudCount = nodeConfigs.filter((node) => node.node_type === 'cloud').length
+  return `${fogCount} fog · ${cloudCount} cloud · ${nodeConfigs.length} total`
+}
+
+function describeWorkload(run: BenchmarkRecord): string {
+  return run.workload === 'manual'
+    ? `manual · ${run.configuration.manual_tasks_per_minute?.toLocaleString() ?? 'unknown'} tasks/min`
+    : `${run.workload} workload`
 }
 
 function formatElapsed(seconds: number): string {
@@ -43,10 +86,13 @@ function mergeBenchmarkHistory(
 
 function BenchmarkPage({
   connected,
+  loadingNodes,
+  nodes,
   onViewComparison,
 }: BenchmarkPageProps) {
   const [duration, setDuration] = useState(60)
   const [workload, setWorkload] = useState<Workload>('normal')
+  const [manualTasksPerMinute, setManualTasksPerMinute] = useState(1200)
   const [history, setHistory] = useState<BenchmarkRecord[]>([])
   const [benchmark, setBenchmark] = useState<BenchmarkRecord | null>(null)
   const [busy, setBusy] = useState(false)
@@ -67,6 +113,10 @@ function BenchmarkPage({
     (!benchmark &&
       activeHistoryRun !== null &&
       dismissedBenchmarkId !== activeHistoryRun.benchmark_id)
+  const validManualRate =
+    Number.isInteger(manualTasksPerMinute) &&
+    manualTasksPerMinute >= 1 &&
+    manualTasksPerMinute <= MANUAL_TASKS_PER_MINUTE_MAX
 
   const fetchHistory = useCallback(async (signal?: AbortSignal) => {
     const response = await getBenchmarks(signal)
@@ -145,11 +195,20 @@ function BenchmarkPage({
   }, [trackedBenchmarkId, trackedBenchmarkStatus, fetchHistory, storeHistory])
 
   const run = async () => {
-    if (busy || !connected || benchmarkRunning) return
+    if (
+      busy ||
+      !connected ||
+      benchmarkRunning ||
+      (workload === 'manual' && !validManualRate)
+    ) return
     setBusy(true)
     setError(null)
     try {
-      const response = await startBenchmark(duration, workload)
+      const response = await startBenchmark(
+        duration,
+        workload,
+        workload === 'manual' ? manualTasksPerMinute : undefined,
+      )
       setBenchmark(response.benchmark)
       setShowProgress(true)
       setDismissedBenchmarkId(null)
@@ -217,7 +276,7 @@ function BenchmarkPage({
             <span className="section-label">Experiments · Benchmark lab</span>
             <h1>Benchmark &amp; Compare Algorithms</h1>
             <p>
-              Run five schedulers against the same deterministic task arrivals
+              Run nine schedulers against the same deterministic task arrivals
               and equivalent fresh node configurations.
             </p>
           </div>
@@ -230,8 +289,24 @@ function BenchmarkPage({
             <h2>Prepare a controlled workload</h2>
             <p>
               Task definitions and arrival times are generated once, then
-              replayed for Round Robin, Weighted Round Robin, Least Loaded,
-              Min-Min, and Adaptive Fog–Cloud.
+              replayed across two groups: Group 1 includes the current four
+              schedulers, and Group 2 adds Fuzzy Logic, TOPSIS, ACO, and PSO.
+              Min-Min remains as a benchmark-only baseline.
+            </p>
+            <p>
+              Simulated node outages use an independent exponential schedule
+              (mean 300 seconds uptime, 15 seconds repair). Every algorithm
+              receives the same seeded schedule; these are explicit simulation
+              assumptions, not measured hardware reliability.
+            </p>
+            <p className="benchmark-node-count" role="status">
+              {nodes.length
+                ? `Current nodes for a new benchmark: ${describeNodeCounts(nodes)}`
+                : loadingNodes
+                  ? 'Loading the current node configuration…'
+                  : connected
+                    ? 'Node configuration is not available.'
+                    : 'Connect to the backend to load the current node configuration.'}
             </p>
           </div>
           <div className="benchmark-config-controls">
@@ -242,13 +317,16 @@ function BenchmarkPage({
                 onChange={(event) => setDuration(Number(event.target.value))}
                 disabled={busy || benchmarkRunning}
               >
+                <option value={15}>15 seconds</option>
                 <option value={30}>30 seconds</option>
                 <option value={60}>60 seconds (default)</option>
                 <option value={120}>120 seconds</option>
+                <option value={300}>5 minutes</option>
+                <option value={600}>10 minutes</option>
               </select>
             </label>
             <label>
-              <span className="section-label">Automatic workload</span>
+              <span className="section-label">Workload profile</span>
               <select
                 value={workload}
                 onChange={(event) => setWorkload(event.target.value as Workload)}
@@ -257,13 +335,31 @@ function BenchmarkPage({
                 <option value="light">Light</option>
                 <option value="normal">Normal</option>
                 <option value="heavy">Heavy</option>
+                <option value="extreme">Extreme</option>
+                <option value="manual">Manual</option>
               </select>
             </label>
+            {workload === 'manual' && (
+              <label>
+                <span className="section-label">Manual rate · tasks/min</span>
+                <input
+                  type="number"
+                  min="1"
+                  max={MANUAL_TASKS_PER_MINUTE_MAX}
+                  step="1"
+                  value={manualTasksPerMinute}
+                  onChange={(event) => setManualTasksPerMinute(Number(event.target.value))}
+                  disabled={busy || benchmarkRunning}
+                  aria-invalid={!validManualRate}
+                />
+                <small>Enter a whole number from 1 to 10,000.</small>
+              </label>
+            )}
             <button
               type="button"
               className="control-button control-button--generate benchmark-run-button"
               onClick={() => void run()}
-              disabled={busy || !connected || benchmarkRunning}
+              disabled={busy || !connected || benchmarkRunning || (workload === 'manual' && !validManualRate)}
             >
               <span className="material-symbols-outlined" aria-hidden="true">
                 science
@@ -281,14 +377,25 @@ function BenchmarkPage({
         )}
 
         <section className="benchmark-algorithm-grid" aria-label="Algorithms in this benchmark">
-          {Object.entries(algorithmNames).map(([key, label], index) => (
-            <article className="panel benchmark-algorithm-card" key={key}>
-              <span className="benchmark-algorithm-index">0{index + 1}</span>
-              <div>
-                <span className="section-label">Scheduler</span>
-                <h3>{label}</h3>
+          {algorithmGroups.map((group) => (
+            <div className="benchmark-algorithm-group" key={group.label}>
+              <h2 className="section-label">{group.label}</h2>
+              <div className="benchmark-algorithm-group-list">
+                {group.algorithms.map((key) => (
+                  <article className="panel benchmark-algorithm-card" key={key}>
+                    <span className="benchmark-algorithm-index">
+                      {String(
+                        [...group.algorithms].indexOf(key) + 1,
+                      ).padStart(2, '0')}
+                    </span>
+                    <div>
+                      <span className="section-label">Scheduler</span>
+                      <h3>{algorithmNames[key]}</h3>
+                    </div>
+                  </article>
+                ))}
               </div>
-            </article>
+            </div>
           ))}
         </section>
 
@@ -321,7 +428,8 @@ function BenchmarkPage({
                     <strong>{new Date(run.created_at).toLocaleString()}</strong>
                     <span>
                       {run.configuration.task_count.toLocaleString()} tasks ·{' '}
-                      {run.duration_seconds}s · {run.workload} workload
+                      {run.duration_seconds}s · {describeWorkload(run)} ·{' '}
+                      {describeNodeCounts(run.configuration.node_configs)}
                     </span>
                   </div>
                   <div className="benchmark-history-meta">
@@ -329,7 +437,8 @@ function BenchmarkPage({
                       {run.status}
                     </span>
                     <span>
-                      {run.completed_experiments}/5 experiments
+                      {run.completed_experiments}/
+                      {run.configuration.algorithm_order.length} experiments
                     </span>
                     <button
                       type="button"
@@ -392,10 +501,19 @@ function BenchmarkPage({
                 {progressStatus}
               </span>
               <span>
-                {trackedBenchmark.completed_experiments} of 5 experiments complete
+                {trackedBenchmark.completed_experiments} of{' '}
+                {trackedBenchmark.configuration.algorithm_order.length} experiments
+                complete
               </span>
               <span>Elapsed {formatElapsed(trackedBenchmark.elapsed_seconds)}</span>
             </div>
+            <p className="benchmark-node-count">
+              Nodes used per algorithm:{' '}
+              {describeNodeCounts(trackedBenchmark.configuration.node_configs)}
+            </p>
+            <p className="benchmark-node-count">
+              Workload: {describeWorkload(trackedBenchmark)}
+            </p>
             <div
               className="benchmark-progress-track"
               role="progressbar"
@@ -416,7 +534,7 @@ function BenchmarkPage({
                 {trackedBenchmark.current_algorithm
                   ? algorithmNames[trackedBenchmark.current_algorithm]
                   : progressStatus === 'completed'
-                    ? 'Five of five results are persisted and ready.'
+                    ? 'All nine results are persisted and ready.'
                     : progressStatus === 'failed'
                       ? 'The comparison is incomplete; partial results are not ranked.'
                       : 'No experiment is currently running.'}

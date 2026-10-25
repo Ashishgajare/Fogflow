@@ -1,9 +1,11 @@
+import random
 import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app import create_app
 from simulation.benchmark import (
@@ -15,6 +17,7 @@ from simulation.benchmark import (
 )
 from simulation.database import SimulationDatabase
 from simulation.engine import SimulationEngine, SimulationError
+from simulation.faults import NodeFaultSchedule
 from simulation.models import DEFAULT_ADAPTIVE_WEIGHTS, DEFAULT_NODE_CONFIGS
 
 
@@ -34,10 +37,10 @@ class BenchmarkEngineTests(unittest.TestCase):
         second = prepare_workload(30, "normal", epoch=self.epoch)
 
         self.assertEqual(first, second)
-        self.assertEqual(len(first), 60)
+        self.assertEqual(len(first), 120)
         self.assertEqual(
             [task["arrival_clock"] for task in first[:4]],
-            [0.5, 1.0, 1.5, 2.0],
+            [0.25, 0.5, 0.75, 1.0],
         )
         self.assertEqual(first[0]["task_id"], "benchmark-task-000001")
 
@@ -50,6 +53,57 @@ class BenchmarkEngineTests(unittest.TestCase):
                 DEFAULT_ADAPTIVE_WEIGHTS,
                 0,
             )
+
+    def test_workload_profiles_generate_doubled_tasks_per_minute(self):
+        expected_counts = {
+            "light": 60,
+            "normal": 240,
+            "heavy": 600,
+            "extreme": 1200,
+        }
+        for workload, expected_count in expected_counts.items():
+            with self.subTest(workload=workload):
+                self.assertEqual(
+                    len(prepare_workload(60, workload, epoch=self.epoch)),
+                    expected_count,
+                )
+
+    def test_benchmark_durations_generate_expected_workload_sizes(self):
+        expected_task_counts = {
+            15: 60,
+            30: 120,
+            60: 240,
+            120: 480,
+            300: 1200,
+            600: 2400,
+        }
+        for duration, expected_count in expected_task_counts.items():
+            with self.subTest(duration=duration):
+                self.assertEqual(
+                    len(prepare_workload(duration, "normal", epoch=self.epoch)),
+                    expected_count,
+                )
+
+    def test_extreme_benchmark_workload_generates_twelve_hundred_tasks_per_minute(self):
+        definitions = prepare_workload(60, "extreme", epoch=self.epoch)
+
+        self.assertEqual(len(definitions), 1200)
+
+    def test_manual_benchmark_uses_the_requested_arrival_rate(self):
+        definitions = prepare_workload(
+            30,
+            "manual",
+            manual_tasks_per_minute=120,
+            epoch=self.epoch,
+        )
+
+        self.assertEqual(len(definitions), 60)
+        self.assertEqual(
+            [task["arrival_clock"] for task in definitions[:3]],
+            [0.5, 1.0, 1.5],
+        )
+        with self.assertRaises(SimulationError):
+            prepare_workload(30, "manual", manual_tasks_per_minute=10_001)
 
     def test_each_algorithm_gets_fresh_node_state_and_live_simulation_is_preserved(self):
         engine = SimulationEngine(self.database, background_simulation=False)
@@ -82,7 +136,10 @@ class BenchmarkEngineTests(unittest.TestCase):
             for algorithm in BENCHMARK_ALGORITHMS
         ]
 
-        self.assertEqual([result["task_count"] for result in results], [15] * 5)
+        self.assertEqual(
+            [result["task_count"] for result in results],
+            [30] * len(BENCHMARK_ALGORITHMS),
+        )
         self.assertEqual(engine.metrics_snapshot(), before)
         self.assertEqual(configs, list(DEFAULT_NODE_CONFIGS))
         self.assertEqual(
@@ -214,6 +271,42 @@ class BenchmarkEngineTests(unittest.TestCase):
         self.assertEqual(deadline["failed_count"], 1)
         self.assertEqual(deadline["deadline_misses"], 1)
 
+    def test_benchmark_node_outage_fails_running_task(self):
+        task = {
+            "task_id": "benchmark-task-000001",
+            "source_sensor_id": "sensor-1",
+            "task_type": "test",
+            "cpu_demand": 10.0,
+            "data_size_mb": 1.0,
+            "priority": 1,
+            "deadline_seconds": None,
+            "arrival_clock": 1.0,
+            "arrival_time": "2025-01-01T00:00:01+00:00",
+        }
+        schedules = {
+            config["id"]: NodeFaultSchedule(
+                random.Random(1),
+                1.1 if config["id"] == "fog-1" else 1000.0,
+            )
+            for config in DEFAULT_NODE_CONFIGS
+        }
+
+        with patch(
+            "simulation.benchmark.create_node_fault_schedules",
+            return_value=schedules,
+        ):
+            result = run_experiment(
+                "round_robin",
+                [task],
+                list(DEFAULT_NODE_CONFIGS),
+                DEFAULT_ADAPTIVE_WEIGHTS,
+                15,
+            )
+
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(result["task_outcomes"][0]["status"], "failed")
+        self.assertIn("transient node outage", result["task_outcomes"][0]["allocation_explanation"])
+
     def _wait_for_status(self, manager, benchmark_id, expected, timeout=5.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -231,17 +324,59 @@ class BenchmarkEngineTests(unittest.TestCase):
         )
         saved = manager.get(benchmark["benchmark_id"])
 
-        self.assertEqual(finished["completed_experiments"], 5)
-        self.assertEqual(finished["result_count"], 5)
+        self.assertEqual(
+            finished["completed_experiments"], len(BENCHMARK_ALGORITHMS)
+        )
+        self.assertEqual(finished["result_count"], len(BENCHMARK_ALGORITHMS))
+        results = manager.results(benchmark["benchmark_id"])["results"]
+        wsm_result = next(
+            result
+            for result in results
+            if result["algorithm"] == "adaptive_fog_cloud"
+        )
+        self.assertEqual(wsm_result["algorithm_label"], "Weighted Sum Model (WSM)")
         self.assertEqual(
             saved["configuration"]["algorithm_order"],
             list(BENCHMARK_ALGORITHMS),
         )
+        self.assertEqual(
+            saved["configuration"]["failure_model"]["name"],
+            "independent-exponential-node-outages-v1",
+        )
+        self.assertEqual(
+            saved["configuration"]["failure_model"]["mean_node_uptime_seconds"],
+            300.0,
+        )
         persisted = self.database.get_benchmark(
             benchmark["benchmark_id"], include_workload=True
         )
-        self.assertEqual(len(persisted["workload_tasks"]), 15)
+        self.assertEqual(len(persisted["workload_tasks"]), 30)
         self.assertEqual(len(manager.list()), 1)
+
+    def test_historical_benchmark_without_algorithm_order_keeps_its_saved_results(self):
+        historical_algorithms = (
+            "round_robin",
+            "weighted_round_robin",
+            "least_loaded",
+            "min_min",
+            "adaptive_fog_cloud",
+        )
+        historical_record = {
+            "status": "completed",
+            "configuration": {},
+            "result_count": len(historical_algorithms),
+            "results": [{"algorithm": algorithm} for algorithm in historical_algorithms],
+        }
+        manager = BenchmarkManager(self.database)
+        with patch.object(
+            self.database, "get_benchmark", return_value=historical_record
+        ):
+            response = manager.results("historical-benchmark")
+
+        self.assertEqual(
+            [result["algorithm"] for result in response["results"]],
+            list(historical_algorithms),
+        )
 
     def test_failed_experiment_is_not_reported_as_a_complete_comparison(self):
         def failing_runner(algorithm, *args, **kwargs):
@@ -327,12 +462,14 @@ class BenchmarkApiTests(unittest.TestCase):
         self.assertEqual(started.status_code, 202)
         benchmark_id = started.get_json()["benchmark"]["benchmark_id"]
         finished = self._wait_for_status(benchmark_id, "completed")
-        self.assertEqual(finished["completed_experiments"], 5)
+        self.assertEqual(
+            finished["completed_experiments"], len(BENCHMARK_ALGORITHMS)
+        )
 
         results = self.client.get(f"/api/benchmarks/{benchmark_id}/results")
         self.assertEqual(results.status_code, 200)
         result_body = results.get_json()
-        self.assertEqual(len(result_body["results"]), 5)
+        self.assertEqual(len(result_body["results"]), len(BENCHMARK_ALGORITHMS))
         self.assertEqual(
             [result["algorithm"] for result in result_body["results"]],
             list(BENCHMARK_ALGORITHMS),
@@ -340,6 +477,45 @@ class BenchmarkApiTests(unittest.TestCase):
         history = self.client.get("/api/benchmarks")
         self.assertEqual(history.status_code, 200)
         self.assertEqual(len(history.get_json()["benchmarks"]), 1)
+
+    def test_benchmark_api_accepts_additional_duration(self):
+        started = self.client.post(
+            "/api/benchmarks",
+            json={"duration_seconds": 15, "workload": "light"},
+        )
+
+        self.assertEqual(started.status_code, 202)
+        benchmark = started.get_json()["benchmark"]
+        self.assertEqual(benchmark["duration_seconds"], 15)
+        completed = self._wait_for_status(benchmark["benchmark_id"], "completed")
+        self.assertEqual(completed["configuration"]["task_count"], 15)
+
+    def test_benchmark_api_persists_manual_workload_rate(self):
+        started = self.client.post(
+            "/api/benchmarks",
+            json={
+                "duration_seconds": 15,
+                "workload": "manual",
+                "manual_tasks_per_minute": 120,
+            },
+        )
+
+        self.assertEqual(started.status_code, 202)
+        benchmark = started.get_json()["benchmark"]
+        self.assertEqual(benchmark["configuration"]["task_count"], 30)
+        self.assertEqual(
+            benchmark["configuration"]["manual_tasks_per_minute"], 120
+        )
+        self._wait_for_status(benchmark["benchmark_id"], "completed")
+        invalid = self.client.post(
+            "/api/benchmarks",
+            json={
+                "duration_seconds": 15,
+                "workload": "manual",
+                "manual_tasks_per_minute": 10_001,
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
 
     def test_results_require_a_completed_benchmark_and_missing_id_is_not_found(self):
         not_found = self.client.get("/api/benchmarks/missing")

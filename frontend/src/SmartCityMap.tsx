@@ -17,8 +17,8 @@ import {
 } from './components/ui/map'
 import {
   CITY_CENTER,
-  CITY_COMPUTE_NODES,
   CITY_SENSORS,
+  getCityComputeNodes,
   type CityDevice,
   type CitySensor,
 } from './sceneData'
@@ -58,9 +58,6 @@ const MAP_STYLES = {
 type MapStyle = keyof typeof MAP_STYLES
 
 const sensorById = new Map(CITY_SENSORS.map((sensor) => [sensor.id, sensor]))
-const computeNodeById = new Map(
-  CITY_COMPUTE_NODES.map((node) => [node.backendNodeId, node]),
-)
 
 function buildHeatmapData(
   counts: Record<string, number>,
@@ -196,6 +193,10 @@ function SmartCityMap({
   const selectedStyle = MAP_STYLES[style]
   const isTilted = style === 'openstreetmap3d'
   const taskCounts = metrics?.task_counts_by_sensor ?? {}
+  const computeNodes = getCityComputeNodes(nodes)
+  const computeNodeById = new Map(
+    computeNodes.map((node) => [node.backendNodeId, node]),
+  )
   const sensor = allocation
     ? sensorById.get(allocation.task.source_sensor_id)
     : undefined
@@ -290,7 +291,7 @@ function SmartCityMap({
             </MarkerTooltip>
           </MapMarker>
         ))}
-        {CITY_COMPUTE_NODES.filter((device) =>
+        {computeNodes.filter((device) =>
           device.kind === 'fog' ? fogVisible : cloudVisible,
         ).map((device) => {
           const telemetry = nodes.find((node) => node.id === device.backendNodeId)
@@ -318,7 +319,11 @@ function SmartCityMap({
                   <span>{device.backendNodeId} · {device.kind} node</span>
                   {telemetry ? (
                     <small>
-                      {telemetry.online ? 'Online' : 'Offline'} · {telemetry.projected_utilization.toFixed(1)}% utilization · Queue {telemetry.queue_length} · {telemetry.network_latency_ms} ms latency
+                      {telemetry.online
+                        ? 'Online'
+                        : telemetry.faulted
+                          ? 'Repairing after simulated outage'
+                          : 'Offline'} · {telemetry.projected_utilization.toFixed(1)}% utilization · Queue {telemetry.queue_length} · {telemetry.network_latency_ms} ms latency
                     </small>
                   ) : (
                     <small>Waiting for backend telemetry</small>
@@ -439,7 +444,13 @@ function SmartCityMap({
               <span>{selectedDevice.backendNodeId}</span>
               {selectedNode ? (
                 <>
-                  <small>{selectedNode.online ? 'Online' : 'Offline'} · {selectedNode.projected_utilization.toFixed(1)}% utilization</small>
+                  <small>
+                    {selectedNode.online
+                      ? 'Online'
+                      : selectedNode.faulted
+                        ? 'Repairing after simulated outage'
+                        : 'Offline'} · {selectedNode.projected_utilization.toFixed(1)}% utilization
+                  </small>
                   <small>Queue {selectedNode.queue_length} · Load {selectedNode.projected_workload}/{selectedNode.processing_capacity} CPU</small>
                   <small>Network {selectedNode.network_latency_ms} ms · Rate {selectedNode.processing_rate} CPU/s</small>
                 </>
@@ -480,7 +491,15 @@ function algorithmLabel(algorithm: Algorithm): string {
     case 'least_loaded':
       return 'Least Loaded'
     case 'adaptive_fog_cloud':
-      return 'Adaptive Fog–Cloud'
+      return 'Weighted Sum Model (WSM)'
+    case 'fuzzy_logic':
+      return 'Fuzzy Logic'
+    case 'topsis':
+      return 'TOPSIS'
+    case 'ant_colony':
+      return 'Ant Colony Optimization (ACO)'
+    case 'particle_swarm':
+      return 'Particle Swarm Optimization (PSO)'
   }
 }
 

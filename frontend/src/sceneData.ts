@@ -1,4 +1,4 @@
-import type { TaskSpecification } from './api'
+import type { NodeTelemetry, TaskSpecification } from './api'
 
 export interface CitySensor {
   kind: 'sensor'
@@ -191,41 +191,35 @@ export const CITY_SENSORS: CitySensor[] = [
   },
 ]
 
-export const CITY_COMPUTE_NODES: CityComputeNode[] = [
-  {
-    kind: 'fog',
-    id: 'FOG-01',
-    name: 'Fog Node 1',
-    backendNodeId: 'fog-1',
-    longitude: 72.8771,
-    latitude: 19.0767,
-    colorHex: '#22D3EE',
-  },
-  {
-    kind: 'fog',
-    id: 'FOG-02',
-    name: 'Fog Node 2',
-    backendNodeId: 'fog-2',
-    longitude: 72.9368,
-    latitude: 19.0631,
-    colorHex: '#3B82F6',
-  },
-  {
-    kind: 'fog',
-    id: 'FOG-03',
-    name: 'Fog Node 3',
-    backendNodeId: 'fog-3',
-    longitude: 72.8122,
-    latitude: 19.1194,
-    colorHex: '#6366F1',
-  },
-  {
-    kind: 'cloud',
-    id: 'CLOUD-DC',
-    name: 'Cloud Server',
-    backendNodeId: 'cloud-1',
-    longitude: 72.8628,
-    latitude: 19.0226,
-    colorHex: '#A855F7',
-  },
-]
+const FOG_NODE_COLORS = ['#22D3EE', '#3B82F6', '#6366F1']
+
+export function getCityComputeNodes(nodes: NodeTelemetry[]): CityComputeNode[] {
+  let fogIndex = 0
+  return nodes.map((node) => {
+    if (node.node_type === 'cloud') {
+      return {
+        kind: 'cloud',
+        id: 'CLOUD-DC',
+        name: node.name,
+        backendNodeId: node.id,
+        longitude: 72.8628,
+        latitude: 19.0226,
+        colorHex: '#A855F7',
+      }
+    }
+
+    const index = fogIndex
+    fogIndex += 1
+    const angle = index * 2.399963229728653
+    const radius = 0.025 + 0.065 * Math.sqrt((index + 1) / 75)
+    return {
+      kind: 'fog',
+      id: `FOG-${String(index + 1).padStart(2, '0')}`,
+      name: node.name,
+      backendNodeId: node.id,
+      longitude: CITY_CENTER[0] + Math.cos(angle) * radius,
+      latitude: CITY_CENTER[1] + Math.sin(angle) * radius * 0.72,
+      colorHex: FOG_NODE_COLORS[index % FOG_NODE_COLORS.length],
+    }
+  })
+}

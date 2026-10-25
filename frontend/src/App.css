@@ -543,7 +543,7 @@
 .kpi-grid {
   display: grid;
   gap: 13px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .kpi-card {
@@ -750,6 +750,108 @@
   font-size: 9px;
   text-align: center;
   white-space: nowrap;
+}
+
+.simulation-config {
+  align-items: stretch;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(280px, 1.2fr);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.fog-node-slider,
+.workload-rates {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fog-node-slider > label {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+}
+
+.fog-node-slider > label strong {
+  color: var(--cyan);
+  font-family: "JetBrains Mono", monospace;
+}
+
+.fog-node-slider input[type="range"] {
+  accent-color: var(--cyan-bright);
+  width: 100%;
+}
+
+.fog-node-slider small,
+.workload-rates small {
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.fog-node-slider .control-button {
+  align-self: flex-start;
+  min-height: 30px;
+  padding-block: 6px;
+}
+
+.workload-rate-list {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.workload-rate {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 4px;
+}
+
+.workload-rate--selected {
+  border-color: rgb(138 235 255 / 55%);
+  color: var(--cyan);
+}
+
+.workload-rate strong {
+  color: var(--text);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+
+.manual-workload-input {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.manual-workload-input input,
+.settings-field input[type="number"],
+.benchmark-config-controls input[type="number"] {
+  background: var(--surface-lowest);
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  min-height: 34px;
+  padding: 6px 9px;
+}
+
+.manual-workload-input > span,
+.manual-workload-input small,
+.benchmark-config-controls label > small {
+  color: var(--text-dim);
+  font-size: 10px;
 }
 
 .node-list {
@@ -1139,6 +1241,7 @@
   color: var(--cyan);
 }
 
+.task-status--failed,
 .task-status--rejected {
   border-color: rgb(255 100 110 / 30%);
   color: #ff858b;
@@ -1229,6 +1332,14 @@
   margin: 0;
 }
 
+.benchmark-config-copy .benchmark-node-count,
+.benchmark-node-count {
+  color: var(--cyan);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  margin-top: 8px;
+}
+
 .benchmark-config-controls {
   align-items: flex-end;
   display: flex;
@@ -1262,9 +1373,25 @@
 }
 
 .benchmark-algorithm-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.benchmark-algorithm-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.benchmark-algorithm-group > h2 {
+  margin: 0;
+}
+
+.benchmark-algorithm-group-list {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .benchmark-algorithm-card {
@@ -1539,7 +1666,7 @@
 .comparison-summary-grid {
   display: grid;
   gap: 11px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .comparison-summary-card {
@@ -1713,9 +1840,14 @@
 .comparison-table-wrap table {
   border-collapse: collapse;
   font-family: "JetBrains Mono", monospace;
+  height: auto;
   min-width: 1160px;
   text-align: left;
   width: 100%;
+}
+
+.comparison-table-wrap tbody tr {
+  height: 1px;
 }
 
 .comparison-table-wrap th,
@@ -1723,7 +1855,8 @@
   border-bottom: 1px solid rgb(60 73 76 / 30%);
   color: var(--text-muted);
   font-size: 9px;
-  padding: 9px 10px;
+  padding: 6px 8px;
+  vertical-align: middle;
   white-space: nowrap;
 }
 
@@ -1741,7 +1874,7 @@
 
 .comparison-table-wrap tbody td:last-child {
   color: var(--cyan);
-  white-space: normal;
+  white-space: nowrap;
 }
 
 .overall-score-row {
@@ -1787,6 +1920,14 @@
   flex-direction: column;
   gap: 7px;
   padding: 13px;
+}
+
+.settings-field--recovery {
+  grid-column: 1 / -1;
+}
+
+.settings-field--recovery .control-button {
+  align-self: flex-start;
 }
 
 .settings-field > label,
@@ -1843,7 +1984,7 @@
     flex-direction: column;
   }
 
-  .benchmark-algorithm-grid {
+  .benchmark-algorithm-group-list {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
@@ -1914,6 +2055,14 @@
 }
 
 @media (max-width: 720px) {
+  .simulation-config {
+    grid-template-columns: 1fr;
+  }
+
+  .workload-rate-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .topbar {
     height: 60px;
     padding: 0 14px;
@@ -2033,7 +2182,7 @@
     width: 100%;
   }
 
-  .benchmark-algorithm-grid {
+  .benchmark-algorithm-group-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

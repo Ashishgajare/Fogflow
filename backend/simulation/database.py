@@ -351,6 +351,59 @@ class SimulationDatabase:
                 ),
             )
 
+    def save_simulation_batch(
+        self,
+        run_id: str,
+        tasks: list[tuple[dict[str, Any], float, float | None]],
+        decisions: list[dict[str, Any]],
+    ) -> None:
+        with self.connection() as connection:
+            connection.executemany(
+                """
+                INSERT INTO tasks
+                    (task_id, run_id, status, assigned_node_id, arrival_clock,
+                     completion_clock, record_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    status = excluded.status,
+                    assigned_node_id = excluded.assigned_node_id,
+                    completion_clock = excluded.completion_clock,
+                    record_json = excluded.record_json
+                """,
+                [
+                    (
+                        record["task_id"],
+                        run_id,
+                        record["status"],
+                        record["assigned_node_id"],
+                        arrival_clock,
+                        completion_clock,
+                        json.dumps(record),
+                    )
+                    for record, arrival_clock, completion_clock in tasks
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO allocation_decisions
+                    (run_id, task_id, algorithm, selected_node_id, explanation,
+                     candidates_json, decision_clock)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        decision["task_id"],
+                        decision["algorithm"],
+                        decision["selected_node_id"],
+                        decision["explanation"],
+                        json.dumps(decision["candidates"]),
+                        decision["decision_clock"],
+                    )
+                    for decision in decisions
+                ],
+            )
+
     def list_tasks(
         self,
         run_id: str,
@@ -385,6 +438,7 @@ class SimulationDatabase:
         created_at: str,
     ) -> None:
         completed = [task for task in tasks if task["status"] == "completed"]
+        failed_count = sum(task["status"] == "failed" for task in tasks)
         rejected_count = sum(task["status"] == "rejected" for task in tasks)
         response_times = [
             task["actual_response_time_ms"]
@@ -397,6 +451,7 @@ class SimulationDatabase:
         result = {
             "task_count": len(tasks),
             "completed_count": len(completed),
+            "failed_count": failed_count,
             "rejected_count": rejected_count,
             "average_response_time_ms": average_response,
         }
